@@ -305,7 +305,7 @@ class ArrayRecord(TypedDict[str, Array], InflatableObject):
 
         for k in list(state_dict.keys()):
             v = state_dict[k] if keep_input else state_dict.pop(k)
-            record[k] = Array.from_numpy_ndarray(v.detach().cpu().numpy())
+            record[k] = Array.from_torch_tensor(v.detach().cpu())
 
         return record
 
@@ -337,7 +337,7 @@ class ArrayRecord(TypedDict[str, Array], InflatableObject):
         self, *, keep_input: bool = True
     ) -> OrderedDict[str, torch.Tensor]:
         """Return the ArrayRecord as a PyTorch ``state_dict``."""
-        if not (torch := sys.modules.get("torch")):
+        if not (sys.modules.get("torch")):
             raise RuntimeError(
                 f"PyTorch is required to use {self.to_torch_state_dict.__name__}"
             )
@@ -346,7 +346,7 @@ class ArrayRecord(TypedDict[str, Array], InflatableObject):
 
         for k in list(self.keys()):
             arr = self[k] if keep_input else self.pop(k)
-            state_dict[k] = torch.from_numpy(arr.numpy())
+            state_dict[k] = arr.torch()
 
         return state_dict
 

@@ -64,6 +64,7 @@ flwr-clientapp = "flwr.supernode.cli:flwr_clientapp"
 python = "^3.9.2"
 # Mandatory dependencies
 numpy = ">=1.26.0,<3.0.0"
+safetensors = "^0.5.3"
 grpcio = "^1.62.3,!=1.65.0"
 grpcio-health-checking = "^1.62.3"
 protobuf = "^4.21.6"

@@ -184,6 +184,7 @@ class SType:
     """Serialisation type."""
 
     NUMPY = "numpy.ndarray"
+    SAFETENSOR = "safetensor"
 
     def __new__(cls) -> SType:
         """Prevent instantiation."""
