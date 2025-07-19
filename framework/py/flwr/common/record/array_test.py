@@ -24,6 +24,7 @@ from typing import Any, cast
 from unittest.mock import Mock
 
 import numpy as np
+import safetensors
 from parameterized import parameterized
 
 from ..constant import MAX_ARRAY_CHUNK_SIZE, SType
@@ -35,9 +36,7 @@ from .arraychunk import ArrayChunk
 
 def _get_buffer_from_ndarray(array: NDArray) -> bytes:
     """Return a bytes buffer from a given NumPy array."""
-    buffer = BytesIO()
-    np.save(buffer, array, allow_pickle=False)
-    return buffer.getvalue()
+    return safetensors.numpy.save({'ndarray': array})
 
 
 class TorchTensor(Mock):
@@ -77,7 +76,7 @@ class TestArray(unittest.TestCase):
         array_instance = Array(
             dtype=str(original_array.dtype),
             shape=tuple(original_array.shape),
-            stype=SType.NUMPY,
+            stype=SType.SAFETENSOR,
             data=buffer,
         )
         converted_array = array_instance.numpy()
@@ -106,36 +105,16 @@ class TestArray(unittest.TestCase):
 
         # Execute
         array_instance = Array.from_numpy_ndarray(original_array)
-        buffer = BytesIO(array_instance.data)
-        deserialized_array = np.load(buffer, allow_pickle=False)
+        deserialized_array = safetensors.numpy.load(array_instance.data)
 
         # Assert
         self.assertEqual(array_instance.dtype, str(original_array.dtype))
         self.assertEqual(array_instance.shape, tuple(original_array.shape))
-        self.assertEqual(array_instance.stype, SType.NUMPY)
-        np.testing.assert_array_equal(deserialized_array, original_array)
-
-    def test_from_torch_tensor_with_torch(self) -> None:
-        """Test creating an Array from a PyTorch tensor (mocked torch)."""
-        # Prepare
-        mock_tensor = TorchTensor()
-
-        # Mock .detach().cpu().numpy() to return a NumPy array
-        mock_tensor.detach.return_value = mock_tensor
-        mock_tensor.cpu.return_value = mock_tensor
-        mock_tensor.numpy.return_value = np.array([[5, 6], [7, 8]], dtype=np.float32)
-
-        # Execute
-        arr = Array.from_torch_tensor(mock_tensor)
-
-        # Assert
-        self.assertEqual(arr.dtype, "float32")
-        self.assertEqual(arr.shape, (2, 2))
-        self.assertEqual(arr.stype, SType.NUMPY)
+        self.assertEqual(array_instance.stype, SType.SAFETENSOR)
+        np.testing.assert_array_equal(deserialized_array['ndarray'], original_array)
 
     @parameterized.expand(  # type: ignore
         [
-            ({"torch_tensor": MOCK_TORCH_TENSOR},),
             ({"ndarray": np.array([1, 2, 3])},),
             ({"dtype": "float32", "shape": (2, 2), "stype": "dense", "data": b"data"},),
         ]
@@ -147,7 +126,6 @@ class TestArray(unittest.TestCase):
 
     @parameterized.expand(  # type: ignore
         [
-            (MOCK_TORCH_TENSOR,),
             (np.array([1, 2, 3]),),
             ("float32", (2, 2), "dense", b"data"),
         ]

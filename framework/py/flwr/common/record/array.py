@@ -20,10 +20,13 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
-from io import BytesIO
 from typing import TYPE_CHECKING, Any, cast, overload
 
 import numpy as np
+from safetensors.numpy import load as np_load
+from safetensors.numpy import save as np_save
+from safetensors.torch import load as pt_load
+from safetensors.torch import save as pt_save
 
 from ..constant import MAX_ARRAY_CHUNK_SIZE, SType
 from ..inflatable import (
@@ -218,16 +221,11 @@ class Array(InflatableObject):
         assert isinstance(
             ndarray, np.ndarray
         ), f"Expected NumPy ndarray, got {type(ndarray)}"
-        buffer = BytesIO()
-        # WARNING: NEVER set allow_pickle to true.
-        # Reason: loading pickled data can execute arbitrary code
-        # Source: https://numpy.org/doc/stable/reference/generated/numpy.save.html
-        np.save(buffer, ndarray, allow_pickle=False)
-        data = buffer.getvalue()
+        data = np_save({"ndarray": ndarray})
         return Array(
             dtype=str(ndarray.dtype),
             shape=tuple(ndarray.shape),
-            stype=SType.NUMPY,
+            stype=SType.SAFETENSOR,
             data=data,
         )
 
@@ -242,20 +240,32 @@ class Array(InflatableObject):
         assert isinstance(
             tensor, torch.Tensor
         ), f"Expected PyTorch Tensor, got {type(tensor)}"
-        return cls.from_numpy_ndarray(tensor.detach().cpu().numpy())
+        # Call safetensor directly to avoid memory copy with np
+        data = pt_save({"torch_tensor": tensor})
+        return Array(
+            dtype=str(tensor.dtype),
+            shape=tuple(tensor.shape),
+            stype=SType.SAFETENSOR,
+            data=data,
+        )
 
     def numpy(self) -> NDArray:
         """Return the array as a NumPy array."""
-        if self.stype != SType.NUMPY:
+        if self.stype != SType.SAFETENSOR:
             raise TypeError(
                 f"Unsupported serialization type for numpy conversion: '{self.stype}'"
             )
-        bytes_io = BytesIO(self.data)
-        # WARNING: NEVER set allow_pickle to true.
-        # Reason: loading pickled data can execute arbitrary code
-        # Source: https://numpy.org/doc/stable/reference/generated/numpy.load.html
-        ndarray_deserialized = np.load(bytes_io, allow_pickle=False)
-        return cast(NDArray, ndarray_deserialized)
+        ndarray_deserialized = np_load(self.data)
+        return cast(NDArray, ndarray_deserialized["ndarray"])
+
+    def torch(self) -> torch.Tensor:
+        """Return the array as a Torch Tensor."""
+        if self.stype != SType.SAFETENSOR:
+            raise TypeError(
+                f"Unsupported serialization type for numpy conversion: '{self.stype}'"
+            )
+        tensor_deserialized = pt_load(self.data)
+        return cast(NDArray, tensor_deserialized["torch_tensor"])
 
     @property
     def children(self) -> dict[str, InflatableObject]:

@@ -48,9 +48,11 @@ def train(msg: Message, context: Context):
     )
 
     # Extract state_dict from model and construct reply message
+    bf16_tensor = torch.ones((2,2), dtype=torch.bfloat16)
+    bf16_test = ArrayRecord({'bf16_tensor': bf16_tensor})
     model_record = ArrayRecord(model.state_dict())
     metric_record = MetricRecord({"train_loss": train_loss})
-    content = RecordDict({"model": model_record, "train_metrics": metric_record})
+    content = RecordDict({"model": model_record, "train_metrics": metric_record, "bf16_test": bf16_test})
     return Message(content=content, reply_to=msg)
 
 
