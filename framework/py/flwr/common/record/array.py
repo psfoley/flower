@@ -222,7 +222,6 @@ class Array(InflatableObject):
             ndarray, np.ndarray
         ), f"Expected NumPy ndarray, got {type(ndarray)}"
         data = np_save({"ndarray": ndarray})
-        # log(INFO,f'safetensor serialized the ndarray')
         return Array(
             dtype=str(ndarray.dtype),
             shape=tuple(ndarray.shape),
@@ -243,7 +242,6 @@ class Array(InflatableObject):
         ), f"Expected PyTorch Tensor, got {type(tensor)}"
         # Call safetensor directly to avoid memory copy with np
         data = pt_save({"torch_tensor": tensor})
-        # log(INFO,f'safetensor serialized the torch tensor')
         return Array(
             dtype=str(tensor.dtype),
             shape=tuple(tensor.shape),
@@ -258,7 +256,6 @@ class Array(InflatableObject):
                 f"Unsupported serialization type for numpy conversion: '{self.stype}'"
             )
         ndarray_deserialized = np_load(self.data)
-        # log(INFO,f'Safetensor deserialized numpy array')
         return cast(NDArray, ndarray_deserialized["ndarray"])
 
     def torch(self) -> torch.Tensor:
@@ -268,7 +265,6 @@ class Array(InflatableObject):
                 f"Unsupported serialization type for numpy conversion: '{self.stype}'"
             )
         tensor_deserialized = pt_load(self.data)
-        # log(INFO,f'Safetensor deserialized torch tensor')
         return cast(NDArray, tensor_deserialized["torch_tensor"])
 
     @property
