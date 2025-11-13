@@ -19,7 +19,7 @@ import io
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Optional, cast
+from typing import Annotated, cast
 
 import typer
 from rich.console import Console
@@ -56,11 +56,11 @@ def ls(  # pylint: disable=too-many-locals, too-many-branches, R0913, R0917
         typer.Argument(help="Path of the Flower project"),
     ] = Path("."),
     federation: Annotated[
-        Optional[str],
+        str | None,
         typer.Argument(help="Name of the federation"),
     ] = None,
     federation_config_overrides: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "--federation-config",
             help=FEDERATION_CONFIG_HELP_MESSAGE,
@@ -74,7 +74,7 @@ def ls(  # pylint: disable=too-many-locals, too-many-branches, R0913, R0917
         ),
     ] = False,
     run_id: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             "--run-id",
             help="Specific run ID to display",
@@ -167,7 +167,7 @@ def ls(  # pylint: disable=too-many-locals, too-many-branches, R0913, R0917
 def _format_runs(run_dict: dict[int, Run], now_isoformat: str) -> list[_RunListType]:
     """Format runs to a list."""
 
-    def _format_datetime(dt: Optional[datetime]) -> str:
+    def _format_datetime(dt: datetime | None) -> str:
         return isoformat8601_utc(dt).replace("T", " ") if dt else "N/A"
 
     run_list: list[_RunListType] = []
