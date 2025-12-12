@@ -32,7 +32,7 @@ class LeRobotClient(NumPyClient):
     def __init__(self, partition_id, local_epochs, trainloader, nn_device=None) -> None:
         self.partition_id = partition_id
         self.trainloader = trainloader
-        self.net = get_model(dataset_stats=trainloader.dataset.stats)
+        self.net = get_model()
         self.local_epochs = local_epochs
         policy = self.net
         self.device = nn_device

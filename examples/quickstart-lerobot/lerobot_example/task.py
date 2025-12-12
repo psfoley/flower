@@ -14,13 +14,15 @@ import torch
 from datasets.utils.logging import disable_progress_bar
 from flwr_datasets import FederatedDataset
 from flwr_datasets.partitioner import GroupedNaturalIdPartitioner
-from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
-from lerobot.common.datasets.utils import (
-    get_hf_dataset_safe_version,
+from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.utils import (
+    dataset_to_policy_features,
+    get_safe_version,
     hf_transform_to_torch,
 )
-from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from lerobot.configs.types import FeatureType
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from torch.utils.data import DataLoader
 
 from .lerobot_federated_dataset import FilteredLeRobotDataset
@@ -78,7 +80,8 @@ def load_data(
         partitioner = GroupedNaturalIdPartitioner(
             partition_by="episode_index", group_size=episodes_per_partition
         )
-        safe_version = get_hf_dataset_safe_version("lerobot/pusht", CODEBASE_VERSION)
+        print(f'partitioner = {partitioner}')
+        safe_version = get_safe_version("lerobot/pusht", CODEBASE_VERSION)
         fds = FederatedDataset(
             dataset="lerobot/pusht",
             partitioners={"train": partitioner},
@@ -89,7 +92,6 @@ def load_data(
     partition.set_transform(hf_transform_to_torch)
     data = FilteredLeRobotDataset(
         repo_id="lerobot/pusht",
-        hf_dataset=partition,
         delta_timestamps=get_delta_timestamps(),
     )
     # Create dataloader for offline training.
@@ -108,13 +110,19 @@ def load_data(
     return trainloader
 
 
-def get_model(dataset_stats: dict):
+def get_model():
     # Set up the the policy.
     # Policies are initialized with a configuration class, in this case `DiffusionConfig`.
     # For this example, no arguments need to be passed because the defaults are set up for PushT.
-    # If you're doing something different, you will likely need to change at least some of the defaults.
-    cfg = DiffusionConfig(down_dims=[256, 512, 1024])
-    policy = DiffusionPolicy(cfg, dataset_stats=dataset_stats)
+    dataset_metadata = LeRobotDatasetMetadata("lerobot/pusht")
+    features = dataset_to_policy_features(dataset_metadata.features)
+    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+
+    # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
+    # we'll just use the defaults and so no arguments other than input/output features need to be passed.
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features)
+    policy = DiffusionPolicy(cfg)
     return policy
 
 
@@ -144,9 +152,8 @@ def train(net=None, trainloader=None, epochs=None, device=None) -> None:
     done = False
     while not done:
         for batch in trainloader:
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            output_dict = policy.forward(batch)
-            loss = output_dict["loss"]
+            #batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()

@@ -17,9 +17,12 @@ def get_evaluate_fn_callback(save_path: Path):
         # Save model if round % 5 = 0 (exactly as frequently as model is evaluated)
         if server_round % 5 == 0:
             # Instantiate model
+            print(f'Calling get_dataset')
             dataset = get_dataset()
-            model = get_model(dataset_stats=dataset.stats)
+            print(f'Calling get_model')
+            model = get_model()
             # Apply current global model weights
+            print(f'Setting model parameters')
             set_params(model, parameters)
             # Save checkpoint
             model.save_pretrained(
@@ -53,7 +56,7 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     # Set global model initialization
     dataset = get_dataset()
-    ndarrays = get_params(get_model(dataset_stats=dataset.stats))
+    ndarrays = get_params(get_model())
     global_model_init = ndarrays_to_parameters(ndarrays)
 
     # Define strategy
