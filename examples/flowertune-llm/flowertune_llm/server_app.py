@@ -33,7 +33,6 @@ def main(grid: Grid, context: Context) -> None:
 
     # Get initial model weights
     init_model = get_model(cfg.model)
-    #arrays = ArrayRecord(get_peft_model_state_dict(init_model))
     arrays = ArrayRecord(init_model.state_dict())
 
     # Define strategy

@@ -63,7 +63,7 @@ def train(msg: Message, context: Context):
     training_arguments.learning_rate = new_lr
     training_arguments.output_dir = msg.content["config"]["save_path"]
 
-    # Construct trainer
+    # Uncomment this is sufficient resources exist for training
     #trainer = SFTTrainer(
     #    model=model,
     #    tokenizer=tokenizer,
@@ -77,8 +77,7 @@ def train(msg: Message, context: Context):
     # Do local training
     #results = trainer.train()
 
-    # Construct and return reply Message
-    #model_record = ArrayRecord(get_peft_model_state_dict(model))
+    # Save model layers locally
     serialized_layer_paths = []
     model_dict = model.state_dict()
     os.makedirs("layers", exist_ok=True)
@@ -87,18 +86,19 @@ def train(msg: Message, context: Context):
         serialized_layer_paths.append(serialized_layer_path)
         with open(serialized_layer_path, 'wb') as file:
             pickle.dump({layer_name: model_dict[layer_name]}, file)
-    #metrics = {
-    #    "train_loss": results.training_loss,
-    #    "num-examples": len(trainset),
-    #}
+
     metrics = {
         "train_loss": 0.0,
         "num-examples": len(trainset),
     }
 
     metric_record = MetricRecord(metrics)
+
+    # A placeholder for arrays are sent. 
+    # The actual layers will be sent in the train_comms function
     content = RecordDict({"arrays": ArrayRecord(), "metrics": metric_record})
-    #Save trained model as context for layer-wise sending
+
+    #Save layer paths so they can be deserialized for individual sending later
     context.state["serialized_layer_paths"] = ConfigRecord({"layer_paths": serialized_layer_paths})
     context.state["current_layer"] = MetricRecord({"idx":0})
     context.state["num_examples"] = MetricRecord({"num-examples": len(trainset)})
@@ -114,6 +114,7 @@ def train_comms(msg: Message, context: Context):
     if idx == (len(serialized_layer_paths) - 1):
         send_complete = True
 
+    # Read model layer from disk
     serialized_layer_path = serialized_layer_paths[idx]
     with open(serialized_layer_path, 'rb') as file:
         model_dict = pickle.load(file)

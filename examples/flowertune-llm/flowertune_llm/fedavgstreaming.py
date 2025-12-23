@@ -111,6 +111,7 @@ class FedAvgStreaming(FedAvg):
             train_metrics_aggr_fn = train_metrics_aggr_fn,
             evaluate_metrics_aggr_fn = evaluate_metrics_aggr_fn,
         )
+        self.comm_tracker = CommunicationTracker() 
 
     def aggregate_train(
         self,
@@ -139,6 +140,10 @@ class FedAvgStreaming(FedAvg):
                 reply_contents,
                 self.weighted_by_key,
             )
+
+        # Track communication costs
+        self.comm_tracker.track(replies)
+
         return arrays, metrics
 
     # pylint: disable=too-many-arguments, too-many-positional-arguments, too-many-locals
@@ -319,3 +324,29 @@ class FedAvgStreaming(FedAvg):
         log(INFO, "")
 
         return result  
+
+class CommunicationTracker:
+    """Communication costs tracker over FL rounds."""
+
+    def __init__(self):
+        self.curr_comm_cost = 0.0
+
+    def track(self, messages: Iterable[Message]):
+        comm_cost = (
+            sum(
+                record.count_bytes()
+                for msg in messages
+                if msg.has_content()
+                for record in msg.content.array_records.values()
+            )
+            / 1024**2
+        )
+
+        self.curr_comm_cost += comm_cost
+        log(
+            INFO,
+            "Communication budget: used %.2f MB (+%.2f MB this round) / 200,000 MB",
+            self.curr_comm_cost,
+            comm_cost,
+        )
+
