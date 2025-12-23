@@ -2,8 +2,9 @@
 
 import os
 import warnings
+import pickle
 
-from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
+from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict, ConfigRecord
 from flwr.clientapp import ClientApp
 from flwr.common.config import unflatten_dict
 from omegaconf import DictConfig
@@ -78,8 +79,14 @@ def train(msg: Message, context: Context):
 
     # Construct and return reply Message
     #model_record = ArrayRecord(get_peft_model_state_dict(model))
-    print(f'model layers = {model.state_dict().keys()}')
-    model_record = ArrayRecord(model.state_dict())
+    serialized_layer_paths = []
+    model_dict = model.state_dict()
+    os.makedirs("layers", exist_ok=True)
+    for layer_name in model.state_dict():
+        serialized_layer_path = f'layers/{msg.metadata.dst_node_id}_{layer_name}.pt'
+        serialized_layer_paths.append(serialized_layer_path)
+        with open(serialized_layer_path, 'wb') as file:
+            pickle.dump({layer_name: model_dict[layer_name]}, file)
     #metrics = {
     #    "train_loss": results.training_loss,
     #    "num-examples": len(trainset),
@@ -90,19 +97,32 @@ def train(msg: Message, context: Context):
     }
 
     metric_record = MetricRecord(metrics)
-    content = RecordDict({"metrics": metric_record})
+    content = RecordDict({"arrays": ArrayRecord(), "metrics": metric_record})
     #Save trained model as context for layer-wise sending
-    context.state["net_parameters"] = model_record
+    context.state["serialized_layer_paths"] = ConfigRecord({"layer_paths": serialized_layer_paths})
     context.state["current_layer"] = MetricRecord({"idx":0})
+    context.state["num_examples"] = MetricRecord({"num-examples": len(trainset)})
 
     return Message(content=content, reply_to=msg)
 
 @app.train("layer_wise_communication")
 def train_comms(msg: Message, context: Context):
     """Send the model layer by layer"""
-    model_dict = context.state["net_parameters"].to_torch_state_dict()
     idx = context.state["current_layer"]["idx"]
+    serialized_layer_paths = context.state["serialized_layer_paths"]["layer_paths"]
     send_complete = False
-    if idx == (len(model_dict.keys()) - 1):
+    if idx == (len(serialized_layer_paths) - 1):
         send_complete = True
+
+    serialized_layer_path = serialized_layer_paths[idx]
+    with open(serialized_layer_path, 'rb') as file:
+        model_dict = pickle.load(file)
+
+    layer_name = list(model_dict.keys())[0]
+    array = ArrayRecord({layer_name: model_dict[layer_name]})
+    num_examples = context.state["num_examples"]
+    content = RecordDict({"array": array, "status": ConfigRecord({"send_complete":send_complete}), "num_examples": num_examples})
+    print(f'Sending layer {layer_name}...')
+    context.state["current_layer"]["idx"] = idx + 1
+    return Message(content=content, reply_to=msg)
     

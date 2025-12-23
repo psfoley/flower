@@ -30,12 +30,13 @@ from flwr.common import (
 )
 from flwr.server import Grid
 
-from flwr.serverapp.strategy import FedAvg
+from flwr.serverapp.strategy import FedAvg, Result
 from flwr.serverapp.strategy.strategy_utils import (
     aggregate_arrayrecords,
     aggregate_metricrecords,
     sample_nodes,
     validate_message_reply_consistency,
+    log_strategy_start_info,
 )
 
 
@@ -228,6 +229,8 @@ class FedAvgStreaming(FedAvg):
             )
 
             send_complete = False
+            # This section performs layer-wise aggregation
+            agg_arrays = ArrayRecord()
             while(not send_complete):
                 print(f'Requesting layer...')
                 # Call strategy to configure training round
@@ -240,14 +243,21 @@ class FedAvgStreaming(FedAvg):
                         message_type="train.layer_wise_communication"
                     )
                 )
-                train_comms_replies = [msg.content for msg in train_comms_replies]
+                send_complete = train_comms_replies[0].content["status"]["send_complete"]
+                agg_array, _ = self.aggregate_train(
+                    current_round,
+                    train_comms_replies,
+                )
+                key = list(agg_array.keys())[0]
+                agg_arrays[key] = agg_array[key]
+
+                print(f'aggregated layer {list(train_comms_replies[0].content["array"].keys())[0]}')
+                if send_complete:
+                    break
                 
 
-
-      
-
             # Aggregate train
-            agg_arrays, agg_train_metrics = self.aggregate_train(
+            _, agg_train_metrics = self.aggregate_train(
                 current_round,
                 train_replies,
             )
