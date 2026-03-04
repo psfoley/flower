@@ -37,6 +37,12 @@ service Control {
   // flwr ls command
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse) {}
 
+  // Get run profile summary
+  rpc GetRunProfile(GetRunProfileRequest) returns (GetRunProfileResponse) {}
+
+  // Stream run profile summary updates
+  rpc StreamRunProfile(StreamRunProfileRequest) returns (stream GetRunProfileResponse) {}
+
   // Get login details upon request
   rpc GetLoginDetails(GetLoginDetailsRequest)
       returns (GetLoginDetailsResponse) {}
@@ -85,6 +91,10 @@ message ListRunsResponse {
   map<uint64, Run> run_dict = 1;
   string now = 2;
 }
+
+message GetRunProfileRequest { uint64 run_id = 1; }
+message GetRunProfileResponse { bytes summary_json = 1; }
+message StreamRunProfileRequest { uint64 run_id = 1; }
 
 message GetLoginDetailsRequest {}
 message GetLoginDetailsResponse {

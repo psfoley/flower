@@ -16,9 +16,11 @@
 
 
 import argparse
+import json
 from logging import DEBUG, ERROR, INFO
 from pathlib import Path
 from queue import Queue
+from typing import Any
 
 import grpc
 
@@ -27,6 +29,7 @@ from flwr.cli.config_utils import get_fab_metadata
 from flwr.cli.install import install_from_fab
 from flwr.cli.utils import get_sha256_hash
 from flwr.common.args import add_args_flwr_app_common
+from flwr.common import ConfigRecord
 from flwr.common.config import (
     get_flwr_dir,
     get_fused_config_from_dir,
@@ -46,6 +49,13 @@ from flwr.common.logger import (
     restore_output,
     start_log_uploader,
     stop_log_uploader,
+)
+from flwr.common.profiling import (
+    ProfileRecorder,
+    clear_active_profiler,
+    clear_profile_publisher,
+    set_active_profiler,
+    set_profile_publisher,
 )
 from flwr.common.serde import (
     context_from_proto,
@@ -69,6 +79,27 @@ from flwr.supercore.app_utils import start_parent_process_monitor
 from flwr.supercore.heartbeat import HeartbeatSender, make_app_heartbeat_fn_grpc
 from flwr.supercore.superexec.plugin import ServerAppExecPlugin
 from flwr.supercore.superexec.run_superexec import run_with_deprecation_warning
+
+
+def _resolve_profile_enabled(
+    run_config: dict[str, Any], override_config: dict[str, Any]
+) -> bool:
+    def _to_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    for key in ("profile.enabled", "profiling.enabled"):
+        if key in override_config:
+            return _to_bool(override_config[key])
+    for key in ("profile.enabled", "profiling.enabled"):
+        if key in run_config:
+            return _to_bool(run_config[key])
+    return False
 
 
 def flwr_serverapp() -> None:
@@ -141,6 +172,7 @@ def run_serverapp(  # pylint: disable=R0913, R0914, R0915, R0917, W0212
     heartbeat_sender = None
     grid = None
     context = None
+    profile_recorder: ProfileRecorder | None = None
     exit_code = ExitCode.SUCCESS
 
     def on_exit() -> None:
@@ -178,10 +210,11 @@ def run_serverapp(  # pylint: disable=R0913, R0914, R0915, R0917, W0212
     )
 
     try:
-        # Initialize the GrpcGrid
+        # Initialize the GrpcGrid (use default pull interval until run_config loaded)
         grid = GrpcGrid(
             serverappio_service_address=serverappio_api_address,
             root_certificates=certificates,
+            pull_interval=3.0,
         )
 
         # Pull ServerAppInputs from LinkState
@@ -225,6 +258,42 @@ def run_serverapp(  # pylint: disable=R0913, R0914, R0915, R0917, W0212
 
         # Update run_config in context
         context.run_config = server_app_run_config
+        grid.pull_interval = float(server_app_run_config.get("grid.pull-interval", 3.0))
+
+        # Ensure profile.enabled reflects overrides (even if not in defaults)
+        if (
+            "profile.enabled" in run.override_config
+            or "profiling.enabled" in run.override_config
+        ):
+            context.run_config["profile.enabled"] = _resolve_profile_enabled(
+                context.run_config, run.override_config
+            )
+
+        # Initialize profiler if enabled
+        profile_enabled = _resolve_profile_enabled(
+            context.run_config, run.override_config
+        )
+        if profile_enabled:
+            profile_recorder = ProfileRecorder(run_id=run.run_id)
+            set_active_profiler(profile_recorder)
+            last_summary: bytes | None = None
+
+            def _publish(summary: dict[str, object]) -> None:
+                nonlocal last_summary
+                summary_json = json.dumps(summary).encode()
+                if summary_json == last_summary:
+                    return
+                last_summary = summary_json
+                context.state["profile_summary"] = ConfigRecord({"json": summary_json})
+                context.state["profile_live"] = ConfigRecord(
+                    {"enabled": True, "final": False}
+                )
+                out_req = PushAppOutputsRequest(
+                    token=token, run_id=run.run_id, context=context_to_proto(context)
+                )
+                _ = grid._stub.PushAppOutputs(out_req)
+
+            set_profile_publisher(_publish)
 
         log(
             DEBUG,
@@ -253,6 +322,16 @@ def run_serverapp(  # pylint: disable=R0913, R0914, R0915, R0917, W0212
         )
 
         # Send resulting context
+        if profile_recorder is not None:
+            summary_json = json.dumps(profile_recorder.summarize()).encode()
+            updated_context.state["profile_summary"] = ConfigRecord(
+                {"json": summary_json}
+            )
+            updated_context.state["profile_live"] = ConfigRecord(
+                {"enabled": True, "final": True}
+            )
+            clear_profile_publisher()
+            clear_active_profiler()
         context_proto = context_to_proto(updated_context)
         log(DEBUG, "[flwr-serverapp] Will push ServerAppOutputs")
         out_req = PushAppOutputsRequest(
@@ -283,6 +362,9 @@ def run_serverapp(  # pylint: disable=R0913, R0914, R0915, R0917, W0212
         exit_code = ExitCode.SERVERAPP_EXCEPTION  # General exit code
         if isinstance(ex, AppExitException):
             exit_code = ex.exit_code
+    finally:
+        clear_profile_publisher()
+        clear_active_profiler()
 
     flwr_exit(
         code=exit_code,

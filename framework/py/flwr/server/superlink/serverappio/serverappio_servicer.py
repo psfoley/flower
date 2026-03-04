@@ -374,10 +374,19 @@ class ServerAppIoServicer(serverappio_pb2_grpc.ServerAppIoServicer):
             context,
         )
 
-        state.set_serverapp_context(request.run_id, context_from_proto(request.context))
+        serverapp_context = context_from_proto(request.context)
+        state.set_serverapp_context(request.run_id, serverapp_context)
 
-        # Remove the token
-        state.delete_token(run_id)
+        # Keep token for live profile updates and clear it on final push.
+        keep_token = False
+        if "profile_live" in serverapp_context.state:
+            live_record = serverapp_context.state["profile_live"]
+            enabled = bool(live_record.get("enabled"))
+            is_final = bool(live_record.get("final"))
+            keep_token = enabled and not is_final
+
+        if not keep_token:
+            state.delete_token(run_id)
         return PushAppOutputsResponse()
 
     def UpdateRunStatus(

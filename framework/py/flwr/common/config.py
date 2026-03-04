@@ -131,8 +131,13 @@ def get_fused_config_from_dir(
         "config", {}
     )
     flat_default_config = flatten_dict(default_config)
-
-    return fuse_dicts(flat_default_config, override_config)
+    normalized_override = _normalize_profile_config_alias(override_config)
+    if (
+        "profile.enabled" in normalized_override
+        and "profile.enabled" not in flat_default_config
+    ):
+        flat_default_config["profile.enabled"] = False
+    return fuse_dicts(flat_default_config, normalized_override)
 
 
 def get_fused_config_from_fab(fab_file: Path | bytes, run: Run) -> UserConfig:
@@ -144,7 +149,13 @@ def get_fused_config_from_fab(fab_file: Path | bytes, run: Run) -> UserConfig:
     """
     default_config = get_fab_config(fab_file)["tool"]["flwr"]["app"].get("config", {})
     flat_config_flat = flatten_dict(default_config)
-    return fuse_dicts(flat_config_flat, run.override_config)
+    normalized_override = _normalize_profile_config_alias(run.override_config)
+    if (
+        "profile.enabled" in normalized_override
+        and "profile.enabled" not in flat_config_flat
+    ):
+        flat_config_flat["profile.enabled"] = False
+    return fuse_dicts(flat_config_flat, normalized_override)
 
 
 def get_fused_config(run: Run, flwr_dir: Path | None) -> UserConfig:
@@ -243,7 +254,17 @@ def parse_config_args(config: list[str] | None, flatten: bool = True) -> dict[st
                     "space-separated key-value pairs."
                 ) from err
 
-    return flat_overrides
+    return _normalize_profile_config_alias(flat_overrides) if flatten else flat_overrides
+
+
+def _normalize_profile_config_alias(config: UserConfig) -> UserConfig:
+    """Normalize run-config aliases for profiling keys."""
+    normalized: UserConfig = dict(config)
+    for key, value in list(config.items()):
+        if key.startswith("profiling."):
+            profile_key = "profile." + key[len("profiling.") :]
+            normalized.setdefault(profile_key, value)
+    return normalized
 
 
 def get_metadata_from_config(config: dict[str, Any]) -> tuple[str, str]:

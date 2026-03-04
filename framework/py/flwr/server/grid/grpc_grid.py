@@ -16,6 +16,7 @@
 
 
 import time
+from time import perf_counter
 from collections.abc import Iterable
 from logging import DEBUG, ERROR, WARNING
 from typing import cast
@@ -24,6 +25,17 @@ import grpc
 
 from flwr.app.error import Error
 from flwr.common import Message, Metadata, RecordDict, now
+from flwr.common.profiling import (
+    get_active_profiler,
+    get_current_round,
+    publish_profile_summary,
+    record_profile_metrics_from_messages,
+)
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 from flwr.common.constant import (
     SERVERAPPIO_API_DEFAULT_CLIENT_ADDRESS,
     SUPERLINK_NODE_ID,
@@ -51,6 +63,7 @@ from flwr.common.logger import log, warn_deprecated_feature
 from flwr.common.message import make_message, remove_content_from_message
 from flwr.common.retry_invoker import make_simple_grpc_retry_invoker, wrap_stub
 from flwr.common.serde import message_to_proto, run_from_proto
+from flwr.common.system_metrics import DiskIoSnapshot, read_disk_io_mb
 from flwr.common.typing import Run
 from flwr.proto.appio_pb2 import (  # pylint: disable=E0611
     PullAppMessagesRequest,
@@ -120,6 +133,7 @@ class GrpcGrid(Grid):
         self,
         serverappio_service_address: str = SERVERAPPIO_API_DEFAULT_CLIENT_ADDRESS,
         root_certificates: bytes | None = None,
+        pull_interval: float = 3.0,
     ) -> None:
         self._addr = serverappio_service_address
         self._cert = root_certificates
@@ -128,6 +142,7 @@ class GrpcGrid(Grid):
         self._channel: grpc.Channel | None = None
         self.node = Node(node_id=SUPERLINK_NODE_ID)
         self._retry_invoker = make_simple_grpc_retry_invoker()
+        self.pull_interval = pull_interval
         super().__init__()
 
     @property
@@ -386,11 +401,92 @@ class GrpcGrid(Grid):
         waits for the replies. It continues to pull replies until either all replies are
         received or the specified timeout duration is exceeded.
         """
+        profiler = get_active_profiler()
+        if profiler is None:
+            log(DEBUG, "[profiling] No active profiler in GrpcGrid.send_and_receive")
+        proc = psutil.Process() if psutil is not None else None
+        start = perf_counter() if profiler is not None else None
+
+        def _disk_delta(
+            start_snapshot: DiskIoSnapshot | None,
+            end_snapshot: DiskIoSnapshot | None,
+        ) -> tuple[float | None, float | None, str | None]:
+            if (
+                start_snapshot is None
+                or end_snapshot is None
+                or not start_snapshot.source
+                or start_snapshot.source != end_snapshot.source
+            ):
+                return None, None, None
+            read_delta = (
+                end_snapshot.read_mb - start_snapshot.read_mb
+                if end_snapshot.read_mb is not None
+                and start_snapshot.read_mb is not None
+                else None
+            )
+            write_delta = (
+                end_snapshot.write_mb - start_snapshot.write_mb
+                if end_snapshot.write_mb is not None
+                and start_snapshot.write_mb is not None
+                else None
+            )
+            return read_delta, write_delta, end_snapshot.source
+
+        overall_mem_start_mb = None
+        overall_disk_start = None
+        if proc is not None:
+            overall_mem_start_mb = proc.memory_info().rss / (1024**2)
+            overall_disk_start = read_disk_io_mb(proc)
+
         # Push messages
+        push_start = perf_counter() if profiler is not None else None
+        mem_start_mb = None
+        disk_start = None
+        if proc is not None:
+            mem_start_mb = proc.memory_info().rss / (1024**2)
+            disk_start = read_disk_io_mb(proc)
         msg_ids = set(self.push_messages(messages))
+        if profiler is not None and push_start is not None:
+            mem_end_mb = None
+            mem_delta_mb = None
+            disk_read_mb = None
+            disk_write_mb = None
+            disk_source = None
+            if proc is not None:
+                mem_end_mb = proc.memory_info().rss / (1024**2)
+                if mem_start_mb is not None:
+                    mem_delta_mb = mem_end_mb - mem_start_mb
+                disk_end = read_disk_io_mb(proc)
+                disk_read_mb, disk_write_mb, disk_source = _disk_delta(
+                    disk_start, disk_end
+                )
+            profiler.record(
+                scope="server",
+                task="network_upstream",
+                round=get_current_round(),
+                node_id=None,
+                duration_ms=(perf_counter() - push_start) * 1000.0,
+                metadata={
+                    "expected_replies": len(msg_ids),
+                    "memory_start_mb": mem_start_mb,
+                    "memory_end_mb": mem_end_mb,
+                    "memory_delta_mb": mem_delta_mb,
+                    "memory_mb": mem_end_mb,
+                    "disk_read_mb": disk_read_mb,
+                    "disk_write_mb": disk_write_mb,
+                    "disk_source": disk_source,
+                },
+            )
         del messages
+        expected_replies = len(msg_ids)
 
         # Pull messages
+        pull_start = perf_counter() if profiler is not None else None
+        mem_start_mb = None
+        disk_start = None
+        if proc is not None:
+            mem_start_mb = proc.memory_info().rss / (1024**2)
+            disk_start = read_disk_io_mb(proc)
         end_time = time.time() + (timeout if timeout is not None else 0.0)
         ret: list[Message] = []
         while timeout is None or time.time() < end_time:
@@ -399,10 +495,78 @@ class GrpcGrid(Grid):
             msg_ids.difference_update(
                 {msg.metadata.reply_to_message_id for msg in res_msgs}
             )
+            if profiler is not None and res_msgs:
+                record_profile_metrics_from_messages(res_msgs)
+                publish_profile_summary()
             if len(msg_ids) == 0:
                 break
             # Sleep
-            time.sleep(3)
+            time.sleep(self.pull_interval)
+        if profiler is not None and pull_start is not None:
+            mem_end_mb = None
+            mem_delta_mb = None
+            disk_read_mb = None
+            disk_write_mb = None
+            disk_source = None
+            if proc is not None:
+                mem_end_mb = proc.memory_info().rss / (1024**2)
+                if mem_start_mb is not None:
+                    mem_delta_mb = mem_end_mb - mem_start_mb
+                disk_end = read_disk_io_mb(proc)
+                disk_read_mb, disk_write_mb, disk_source = _disk_delta(
+                    disk_start, disk_end
+                )
+            profiler.record(
+                scope="server",
+                task="network_downstream",
+                round=get_current_round(),
+                node_id=None,
+                duration_ms=(perf_counter() - pull_start) * 1000.0,
+                metadata={
+                    "received": len(ret),
+                    "memory_start_mb": mem_start_mb,
+                    "memory_end_mb": mem_end_mb,
+                    "memory_delta_mb": mem_delta_mb,
+                    "memory_mb": mem_end_mb,
+                    "disk_read_mb": disk_read_mb,
+                    "disk_write_mb": disk_write_mb,
+                    "disk_source": disk_source,
+                },
+            )
+        if profiler is not None and start is not None:
+            duration_ms = (perf_counter() - start) * 1000.0
+            mem_end_mb = None
+            mem_delta_mb = None
+            disk_read_mb = None
+            disk_write_mb = None
+            disk_source = None
+            if proc is not None:
+                mem_end_mb = proc.memory_info().rss / (1024**2)
+                if overall_mem_start_mb is not None:
+                    mem_delta_mb = mem_end_mb - overall_mem_start_mb
+                disk_end = read_disk_io_mb(proc)
+                disk_read_mb, disk_write_mb, disk_source = _disk_delta(
+                    overall_disk_start, disk_end
+                )
+            profiler.record(
+                scope="server",
+                task="send_and_receive",
+                round=get_current_round(),
+                node_id=None,
+                duration_ms=duration_ms,
+                metadata={
+                    "expected_replies": expected_replies,
+                    "memory_start_mb": overall_mem_start_mb,
+                    "memory_end_mb": mem_end_mb,
+                    "memory_delta_mb": mem_delta_mb,
+                    "memory_mb": mem_end_mb,
+                    "disk_read_mb": disk_read_mb,
+                    "disk_write_mb": disk_write_mb,
+                    "disk_source": disk_source,
+                },
+            )
+            publish_profile_summary()
+
         return ret
 
     def close(self) -> None:

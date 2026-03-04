@@ -16,6 +16,7 @@ Problem-oriented how-to guides show step-by-step how to achieve a specific goal.
     :titlesonly:
 
     how-to-run-flower-with-deployment-engine
+    how-to-profile-runs
     how-to-enable-tls-connections
     how-to-authenticate-supernodes
     how-to-configure-logging

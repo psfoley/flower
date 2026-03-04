@@ -16,8 +16,14 @@
 
 
 import inspect
+from time import perf_counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 
 from flwr.app.message_type import MessageType
 from flwr.app.metadata import validate_message_type
@@ -27,8 +33,10 @@ from flwr.client.message_handler.message_handler import (
 )
 from flwr.client.mod.utils import make_ffn
 from flwr.client.typing import ClientFnExt, Mod
-from flwr.common import Context, Message
+from flwr.common import Context, Message, MetricRecord
 from flwr.common.logger import warn_deprecated_feature
+from flwr.common.profiling import get_active_profiler
+from flwr.common.system_metrics import read_disk_io_mb
 
 from .typing import ClientAppCallable
 
@@ -139,28 +147,159 @@ class ClientApp:
     def __call__(self, message: Message, context: Context) -> Message:
         """Execute `ClientApp`."""
         with self._lifespan(context):
+            mem_start_mb = None
+            disk_start = None
+            proc = psutil.Process() if psutil is not None else None
+            if proc is not None:
+                mem_start_mb = proc.memory_info().rss / (1024**2)
+                disk_start = read_disk_io_mb(proc)
+            start = perf_counter()
+            category = message.metadata.message_type
+            action = DEFAULT_ACTION
             # Execute message using `client_fn`
             if self._call:
-                return self._call(message, context)
+                out_message = self._call(message, context)
+            else:
+                # Get the category and the action
+                # A valid message type is of the form "<category>" or "<category>.<action>",
+                # where <category> must be "train"/"evaluate"/"query", and <action> is a
+                # valid Python identifier
+                if not validate_message_type(message.metadata.message_type):
+                    raise ValueError(
+                        f"Invalid message type: {message.metadata.message_type}"
+                    )
 
-            # Get the category and the action
-            # A valid message type is of the form "<category>" or "<category>.<action>",
-            # where <category> must be "train"/"evaluate"/"query", and <action> is a
-            # valid Python identifier
-            if not validate_message_type(message.metadata.message_type):
-                raise ValueError(
-                    f"Invalid message type: {message.metadata.message_type}"
+                category, action = message.metadata.message_type, DEFAULT_ACTION
+                if "." in category:
+                    category, action = category.split(".")
+
+                # Check if the function is registered
+                if (full_name := f"{category}.{action}") in self._registered_funcs:
+                    out_message = self._registered_funcs[full_name](message, context)
+                else:
+                    raise ValueError(
+                        f"No {category} function registered with name '{action}'"
+                    )
+
+            # Inject profiling metric if enabled
+            if context.run_config.get("profile.enabled"):
+                duration_ms = (perf_counter() - start) * 1000.0
+                task_name = (
+                    category if action == DEFAULT_ACTION else f"{category}.{action}"
                 )
+                mem_end_mb = None
+                mem_delta_mb = None
+                disk_read_mb = None
+                disk_write_mb = None
+                disk_source = None
+                if proc is not None:
+                    mem_end_mb = proc.memory_info().rss / (1024**2)
+                    if mem_start_mb is not None:
+                        mem_delta_mb = mem_end_mb - mem_start_mb
+                    disk_end = read_disk_io_mb(proc)
+                    if (
+                        disk_start is not None
+                        and disk_end is not None
+                        and disk_start.source
+                        and disk_start.source == disk_end.source
+                    ):
+                        disk_read_mb = (
+                            disk_end.read_mb - disk_start.read_mb
+                            if disk_end.read_mb is not None
+                            and disk_start.read_mb is not None
+                            else None
+                        )
+                        disk_write_mb = (
+                            disk_end.write_mb - disk_start.write_mb
+                            if disk_end.write_mb is not None
+                            and disk_start.write_mb is not None
+                            else None
+                        )
+                        disk_source = disk_end.source
+                if out_message is not None and not out_message.has_error():
+                    record = None
+                    if out_message.content is not None:
+                        if out_message.content.metric_records:
+                            record = next(
+                                iter(out_message.content.metric_records.values())
+                            )
+                        else:
+                            record = MetricRecord()
+                            out_message.content["metrics"] = record
+                    if record is not None:
+                        record["profile.client.total.ms"] = duration_ms
+                        record[f"profile.client.{task_name}.ms"] = duration_ms
+                        if mem_end_mb is not None:
+                            record["profile.client.total.mem_mb"] = mem_end_mb
+                            record[f"profile.client.{task_name}.mem_mb"] = mem_end_mb
+                            record[
+                                "profile.client.total.mem_end_mb"
+                            ] = mem_end_mb
+                            record[
+                                f"profile.client.{task_name}.mem_end_mb"
+                            ] = mem_end_mb
+                        if mem_start_mb is not None:
+                            record[
+                                "profile.client.total.mem_start_mb"
+                            ] = mem_start_mb
+                            record[
+                                f"profile.client.{task_name}.mem_start_mb"
+                            ] = mem_start_mb
+                        if mem_delta_mb is not None:
+                            record[
+                                "profile.client.total.mem_delta_mb"
+                            ] = mem_delta_mb
+                            record[
+                                f"profile.client.{task_name}.mem_delta_mb"
+                            ] = mem_delta_mb
+                        if disk_read_mb is not None:
+                            record[
+                                "profile.client.total.disk_read_mb"
+                            ] = disk_read_mb
+                            record[
+                                f"profile.client.{task_name}.disk_read_mb"
+                            ] = disk_read_mb
+                        if disk_write_mb is not None:
+                            record[
+                                "profile.client.total.disk_write_mb"
+                            ] = disk_write_mb
+                            record[
+                                f"profile.client.{task_name}.disk_write_mb"
+                            ] = disk_write_mb
+                profiler = get_active_profiler()
+                if profiler is not None:
+                    metadata = {}
+                    if mem_start_mb is not None:
+                        metadata["memory_start_mb"] = mem_start_mb
+                    if mem_end_mb is not None:
+                        metadata["memory_end_mb"] = mem_end_mb
+                        metadata["memory_mb"] = mem_end_mb
+                    if mem_delta_mb is not None:
+                        metadata["memory_delta_mb"] = mem_delta_mb
+                    if disk_read_mb is not None:
+                        metadata["disk_read_mb"] = disk_read_mb
+                    if disk_write_mb is not None:
+                        metadata["disk_write_mb"] = disk_write_mb
+                    if disk_source is not None:
+                        metadata["disk_source"] = disk_source
+                    profiler.record(
+                        scope="client",
+                        task="total",
+                        round=None,
+                        node_id=context.node_id,
+                        duration_ms=duration_ms,
+                        metadata=metadata,
+                    )
+                    profiler.record(
+                        scope="client",
+                        task=task_name,
+                        round=None,
+                        node_id=context.node_id,
+                        duration_ms=duration_ms,
+                        metadata=metadata,
+                    )
 
-            category, action = message.metadata.message_type, DEFAULT_ACTION
-            if "." in category:
-                category, action = category.split(".")
-
-            # Check if the function is registered
-            if (full_name := f"{category}.{action}") in self._registered_funcs:
-                return self._registered_funcs[full_name](message, context)
-
-            raise ValueError(f"No {category} function registered with name '{action}'")
+            return out_message
 
     def train(
         self, action: str = DEFAULT_ACTION, *, mods: list[Mod] | None = None
