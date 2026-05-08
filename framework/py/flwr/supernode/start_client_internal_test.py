@@ -141,6 +141,63 @@ class TestStartClientInternal(unittest.TestCase):  # pylint: disable=R0902
         self.mock_state.store_run.assert_not_called()
         self.mock_state.store_context.assert_not_called()
 
+    def test_pull_and_store_message_publishes_after_objects_are_stored(self) -> None:
+        """Test that messages are only visible after their objects are available."""
+        # Prepare
+        self._prepare_for_pull_and_store_message()
+        self.mock_state.get_run.return_value = Mock()  # Mock non-None return
+
+        def assert_objects_stored_before_message(_: Message) -> None:
+            assert self.mock_object_store.put.call_count == len(self.simple_store)
+
+        self.mock_state.store_message.side_effect = assert_objects_stored_before_message
+
+        # Execute
+        res = _pull_and_store_message(
+            state=self.mock_state,
+            ffs=self.mock_ffs,
+            object_store=self.mock_object_store,
+            node_config={},  # No need for this test
+            receive=self.mock_receive,
+            get_run=self.mock_get_run,
+            get_fab=self.mock_get_fab,
+            pull_object=self.mock_pull_object,
+            trusted_entities={},
+        )
+
+        # Assert
+        assert res == self.run_id
+        self._assert_message_pulled_and_stored()
+
+    def test_pull_and_store_message_returns_none_when_object_pull_fails(self) -> None:
+        """Test failed object pulls are not exposed to ClientApp."""
+        # Prepare
+        self._prepare_for_pull_and_store_message()
+        self.mock_state.get_run.return_value = Mock()  # Mock non-None return
+        self.mock_pull_object.side_effect = RuntimeError("missing object")
+
+        # Execute
+        res = _pull_and_store_message(
+            state=self.mock_state,
+            ffs=self.mock_ffs,
+            object_store=self.mock_object_store,
+            node_config={},  # No need for this test
+            receive=self.mock_receive,
+            get_run=self.mock_get_run,
+            get_fab=self.mock_get_fab,
+            pull_object=self.mock_pull_object,
+            trusted_entities={},
+        )
+
+        # Assert
+        assert res is None
+        message_without_content = self.mock_receive.return_value[0]
+        self.mock_state.store_message.assert_not_called()
+        self.mock_state.delete_messages.assert_not_called()
+        self.mock_object_store.delete.assert_called_once_with(
+            message_without_content.metadata.message_id
+        )
+
     def test_pull_and_store_message_with_unknown_run_id(self) -> None:
         """Test that a message of an unknown run ID is pulled and stored."""
         # Prepare

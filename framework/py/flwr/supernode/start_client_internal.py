@@ -384,9 +384,6 @@ def _pull_and_store_message(  # pylint: disable=too-many-positional-arguments
         # Preregister the object tree of the message
         obj_ids_to_pull = object_store.preregister(run_id, object_tree)
 
-        # Store the message in the state (note this message has no content)
-        state.store_message(message)
-
         try:
             # Pull and store objects of the message in the ObjectStore
             obj_contents = pull_objects(
@@ -396,6 +393,11 @@ def _pull_and_store_message(  # pylint: disable=too-many-positional-arguments
             for obj_id in list(obj_contents.keys()):
                 object_store.put(obj_id, obj_contents.pop(obj_id))
 
+            # Store the message in the state only after all objects are available
+            # locally. Otherwise SuperExec can hand a partial object tree to
+            # ClientApp, which fails while inflating the message.
+            state.store_message(message)
+
             log(INFO, "Received successfully")
         except Exception as err:  # pylint: disable=broad-except
             log(
@@ -404,8 +406,8 @@ def _pull_and_store_message(  # pylint: disable=too-many-positional-arguments
                 message.metadata.message_id,
                 err,
             )
-            state.delete_messages(message_ids=[message.metadata.message_id])
             object_store.delete(message.metadata.message_id)
+            return None
 
     except RunNotRunningException:
         if message is None:
