@@ -14,7 +14,7 @@
 # ==============================================================================
 """Fleet API message handlers."""
 
-from logging import ERROR
+from logging import ERROR, WARNING
 
 from flwr.common import Message, log, now
 from flwr.common.constant import (
@@ -163,9 +163,15 @@ def pull_messages(  # pylint: disable=too-many-locals
             run_id_to_record = msg.metadata.run_id
 
         except NoObjectInStoreError as e:
-            log(ERROR, e.message)
-            # Delete message ins from state
-            state.delete_messages(message_ins_ids={msg_object_id})
+            log(
+                WARNING,
+                "[Fleet.PullMessages] Object tree for message_id=%s "
+                "run_id=%s node_id=%s is not ready yet: %s",
+                msg_object_id,
+                msg.metadata.run_id,
+                node_id,
+                e.message,
+            )
 
     response = PullMessagesResponse(messages_list=msg_proto, message_object_trees=trees)
 

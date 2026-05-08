@@ -16,7 +16,7 @@
 
 
 import threading
-from logging import DEBUG, ERROR, INFO
+from logging import DEBUG, ERROR, INFO, WARNING
 
 import grpc
 
@@ -292,9 +292,14 @@ class ServerAppIoServicer(serverappio_pb2_grpc.ServerAppIoServicer):
                 messages_list.append(message_to_proto(msg))
                 trees.append(obj_tree)
             except NoObjectInStoreError as e:
-                log(ERROR, e.message)
-                # Delete message ins from state
-                state.delete_messages(message_ins_ids={msg_object_id})
+                log(
+                    WARNING,
+                    "[ServerAppIo.PullMessages] Object tree for reply "
+                    "message_id=%s run_id=%s is not ready yet: %s",
+                    msg_object_id,
+                    request.run_id,
+                    e.message,
+                )
 
         return PullAppMessagesResponse(
             messages_list=messages_list, message_object_trees=trees
