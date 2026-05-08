@@ -296,10 +296,6 @@ def run_torchtitan_training(
     trainer_cfg = getattr(cfg, "trainer", {})
     titan_cfg = getattr(trainer_cfg, "torchtitan", {})
     command = str(getattr(titan_cfg, "command", "")).strip()
-    if not command:
-        raise ValueError(
-            "trainer.backend is 'torchtitan' but trainer.torchtitan.command is empty"
-        )
 
     output_dir = os.path.join(layer_dir(context), "torchtitan")
     os.makedirs(output_dir, exist_ok=True)
@@ -336,16 +332,6 @@ def run_torchtitan_training(
             _config_value(context, "trainer.torchtitan.dcp_threads", 8),
         )
     )
-    torch.save(state_dict, input_state_path)
-    if dcp_enabled:
-        _save_state_dict_as_dcp(
-            state_dict,
-            input_dcp_dir,
-            train_spec_name=dcp_train_spec,
-            model_args_key=dcp_model_args,
-            dcp_threads=dcp_threads,
-        )
-
     env = os.environ.copy()
     scheduler_env = {
         "FLWR_TORCHTITAN_INPUT_STATE": input_state_path,
@@ -362,15 +348,27 @@ def run_torchtitan_training(
         _config_value(context, "scheduler.backend", "local")
     ).strip().lower()
     dry_run = _as_bool(
-        _config_value(context, "trainer.dry-run", _config_value(context, "trainer.dry_run", False)),
+        _config_value(
+            context,
+            "trainer.dry-run",
+            _config_value(context, "trainer.dry_run", False),
+        ),
         default=False,
     )
     round_id = int(_config_value(context, "current-round", 0))
     client_name = _config_str(context, "client.name", str(context.node_id))
-    dataset_name = _config_str(context, "client.dataset-name", _config_str(context, "dataset.name", ""))
+    dataset_name = _config_str(
+        context, "client.dataset-name", _config_str(context, "dataset.name", "")
+    )
     dataset_path = _config_str(context, "client.dataset-path", "")
     hf_assets_path = _config_str(context, "client.hf-assets-path", "")
-    train_steps = int(_config_value(context, "client.train-steps", _config_value(context, "trainer.train-steps", 0)))
+    train_steps = int(
+        _config_value(
+            context,
+            "client.train-steps",
+            _config_value(context, "trainer.train-steps", 0),
+        )
+    )
     model_name = _config_str(context, "model.name", "")
     model_flavor = _config_str(context, "trainer.torchtitan.model-flavor", "")
     python_exec = _config_str(context, "trainer.python-exec", "python")
@@ -448,6 +446,12 @@ def run_torchtitan_training(
         "torchtitan_config_path": os.path.join(output_dir, config_filename),
     }
 
+    if scheduler_backend not in {"", "none", "local", "slurm", "flux"}:
+        raise ValueError(
+            f"Unsupported scheduler.backend '{scheduler_backend}'. "
+            "Use local, slurm, or flux."
+        )
+
     if _config_str(context, "trainer.torchtitan.config-template", "").strip():
         config_template = _template_path(
             context,
@@ -455,8 +459,47 @@ def run_torchtitan_training(
             "torchtitan.toml.j2",
         )
         rendered_toml = _render_template_file(config_template, render_context)
-        with open(render_context["torchtitan_config_path"], "w", encoding="utf-8") as file:
+        with open(
+            render_context["torchtitan_config_path"], "w", encoding="utf-8"
+        ) as file:
             file.write(rendered_toml)
+
+    def write_scheduler_script(backend: str) -> str:
+        """Render the configured scheduler script and return its path."""
+        if backend == "slurm":
+            script_path = os.path.join(output_dir, "torchtitan_slurm.sh")
+            template_path = _template_path(
+                context,
+                "scheduler.slurm.script-template",
+                "slurm_train.sh.j2",
+            )
+        elif backend == "flux":
+            script_path = os.path.join(output_dir, "torchtitan_flux.sh")
+            template_path = _template_path(
+                context,
+                "scheduler.flux.script-template",
+                "flux_train.sh.j2",
+            )
+        else:
+            return ""
+
+        render_context["workdir"] = workdir or ""
+        render_context["script_path"] = script_path
+        script_text = _render_template_file(template_path, render_context)
+        with open(script_path, "w", encoding="utf-8") as script_file:
+            script_file.write(script_text)
+        os.chmod(script_path, 0o755)
+        return script_path
+
+    custom_scheduler_template = False
+    if scheduler_backend == "slurm":
+        custom_scheduler_template = bool(
+            _config_str(context, "scheduler.slurm.script-template", "").strip()
+        )
+    elif scheduler_backend == "flux":
+        custom_scheduler_template = bool(
+            _config_str(context, "scheduler.flux.script-template", "").strip()
+        )
 
     def run_local() -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -470,6 +513,7 @@ def run_torchtitan_training(
         )
 
     if dry_run:
+        script_path = write_scheduler_script(scheduler_backend)
         dry_run_report = os.path.join(output_dir, "dry_run_summary.txt")
         with open(dry_run_report, "w", encoding="utf-8") as file:
             file.write(
@@ -479,7 +523,7 @@ def run_torchtitan_training(
                     scheduler.backend={scheduler_backend}
                     command={command}
                     workdir={workdir or ''}
-                    script_path=
+                    script_path={script_path}
                     run_id={context.run_id}
                     node_id={context.node_id}
                     client.name={client_name}
@@ -489,6 +533,27 @@ def run_torchtitan_training(
                 )
             )
         return _normalize_state_dict_for_hf(state_dict)
+
+    if not command and (
+        scheduler_backend in {"", "none", "local"} or not custom_scheduler_template
+    ):
+        raise ValueError(
+            "trainer.backend is 'torchtitan' but no TorchTitan command was "
+            "provided. Set trainer.torchtitan.command, set trainer.dry-run=true, "
+            "or provide scheduler.slurm.script-template / "
+            "scheduler.flux.script-template containing the training command."
+        )
+
+    torch.save(state_dict, input_state_path)
+    if dcp_enabled:
+        _save_state_dict_as_dcp(
+            state_dict,
+            input_dcp_dir,
+            train_spec_name=dcp_train_spec,
+            model_args_key=dcp_model_args,
+            dcp_threads=dcp_threads,
+        )
+
     if scheduler_backend in {"", "none", "local"}:
         result = run_local()
     elif scheduler_backend == "slurm":
@@ -501,19 +566,6 @@ def run_torchtitan_training(
         slurm_wait = _as_bool(
             _config_value(context, "scheduler.slurm.wait", True), default=True
         )
-
-        script_path = os.path.join(output_dir, "torchtitan_slurm.sh")
-        slurm_template_path = _template_path(
-            context,
-            "scheduler.slurm.script-template",
-            "slurm_train.sh.j2",
-        )
-        render_context["workdir"] = workdir or ""
-        render_context["script_path"] = script_path
-        script_text = _render_template_file(slurm_template_path, render_context)
-        with open(script_path, "w", encoding="utf-8") as script_file:
-            script_file.write(script_text)
-        os.chmod(script_path, 0o755)
 
         submit_parts = [slurm_submit]
         if slurm_wait:
@@ -537,7 +589,7 @@ def run_torchtitan_training(
             submit_parts.extend(shlex.split(scheduler_extra_args))
         if slurm_extra_args:
             submit_parts.extend(shlex.split(slurm_extra_args))
-        submit_parts.append(script_path)
+        submit_parts.append(write_scheduler_script("slurm"))
 
         result = subprocess.run(
             submit_parts,
@@ -554,24 +606,12 @@ def run_torchtitan_training(
         flux_extra_args = str(
             _config_value(context, "scheduler.flux.extra-args", "")
         ).strip()
-        flux_script_path = os.path.join(output_dir, "torchtitan_flux.sh")
-        flux_template_path = _template_path(
-            context,
-            "scheduler.flux.script-template",
-            "flux_train.sh.j2",
-        )
-        render_context["workdir"] = workdir or ""
-        render_context["script_path"] = flux_script_path
-        flux_script_text = _render_template_file(flux_template_path, render_context)
-        with open(flux_script_path, "w", encoding="utf-8") as script_file:
-            script_file.write(flux_script_text)
-        os.chmod(flux_script_path, 0o755)
         flux_parts = shlex.split(flux_run)
         if scheduler_extra_args:
             flux_parts.extend(shlex.split(scheduler_extra_args))
         if flux_extra_args:
             flux_parts.extend(shlex.split(flux_extra_args))
-        flux_parts.append(flux_script_path)
+        flux_parts.append(write_scheduler_script("flux"))
 
         result = subprocess.run(
             flux_parts,
@@ -581,12 +621,6 @@ def run_torchtitan_training(
             text=True,
             check=False,
         )
-    else:
-        raise ValueError(
-            f"Unsupported scheduler.backend '{scheduler_backend}'. "
-            "Use local, slurm, or flux."
-        )
-
     if result.returncode != 0:
         raise RuntimeError(
             "TorchTitan command failed with exit code "
