@@ -631,11 +631,18 @@ def run_torchtitan_training(
         trained_state = extract_state_dict(payload)
         return _normalize_state_dict_for_hf(trained_state)
 
-    if dcp_enabled and os.path.isdir(output_dcp_dir):
+    if os.path.isdir(output_dcp_dir):
         return _load_state_dict_from_dcp(
             output_dcp_dir,
             train_spec_name=dcp_train_spec,
             model_args_key=dcp_model_args,
+        )
+
+    if os.path.islink(output_dcp_dir):
+        raise FileNotFoundError(
+            "TorchTitan command wrote an output_state.dcp symlink, but its "
+            f"target is not a readable directory: {output_dcp_dir} -> "
+            f"{os.readlink(output_dcp_dir)}"
         )
 
     raise FileNotFoundError(
