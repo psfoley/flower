@@ -416,15 +416,16 @@ class GrpcGrid(Grid):
                 # downstream timing as internal metadata so strategy reply validation is
                 # not affected by extra MetricRecords.
                 proto_msg = message_from_proto(msg_proto)
-                net_delivery_record = proto_msg.content.metric_records.get(
-                    "_flwr_network_delivery"
-                )
-                if net_delivery_record is not None:
-                    downstream_ms = net_delivery_record.get("downstream_ms")
-                    if isinstance(downstream_ms, (int, float)):
-                        message.metadata.__dict__["_network_downstream_ms"] = float(
-                            downstream_ms
-                        )
+                if proto_msg.has_content():
+                    net_delivery_record = proto_msg.content.metric_records.get(
+                        "_flwr_network_delivery"
+                    )
+                    if net_delivery_record is not None:
+                        downstream_ms = net_delivery_record.get("downstream_ms")
+                        if isinstance(downstream_ms, (int, float)):
+                            message.metadata.__dict__["_network_downstream_ms"] = (
+                                float(downstream_ms)
+                            )
                 message.metadata.__dict__["_message_id"] = msg_id
                 inflated_msgs.append(message)
 

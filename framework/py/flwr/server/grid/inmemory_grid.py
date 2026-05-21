@@ -145,14 +145,17 @@ class InMemoryGrid(Grid):
         # Pull Messages
         message_res_list = self.state.get_message_res(message_ids=msg_ids)
         for msg_res in message_res_list:
-            metric_record = msg_res.content.metric_records.get("_flwr_network_delivery")
-            if metric_record is not None:
-                downstream_ms = metric_record.get("downstream_ms")
-                if isinstance(downstream_ms, (int, float)):
-                    msg_res.metadata.__dict__["_network_downstream_ms"] = float(
-                        downstream_ms
-                    )
-                del msg_res.content.metric_records["_flwr_network_delivery"]
+            if msg_res.has_content():
+                metric_record = msg_res.content.metric_records.get(
+                    "_flwr_network_delivery"
+                )
+                if metric_record is not None:
+                    downstream_ms = metric_record.get("downstream_ms")
+                    if isinstance(downstream_ms, (int, float)):
+                        msg_res.metadata.__dict__["_network_downstream_ms"] = float(
+                            downstream_ms
+                        )
+                    del msg_res.content.metric_records["_flwr_network_delivery"]
         # Get IDs of Messages these replies are for
         message_ins_ids_to_delete = {
             msg_res.metadata.reply_to_message_id for msg_res in message_res_list
