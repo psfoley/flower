@@ -108,6 +108,167 @@ def _dcp_checkpoint_exists(path: str) -> bool:
     return os.path.isdir(path) and os.path.exists(os.path.join(path, ".metadata"))
 
 
+def _get_attr_any(obj: object, names: tuple[str, ...]) -> int | None:
+    for name in names:
+        value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _state_dict_signature(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, int | None]:
+    """Infer model-shape hints from an HF-like state_dict."""
+    dim = None
+    vocab_size = None
+    q_out_dim = None
+    kv_out_dim = None
+    layer_ids: set[int] = set()
+
+    layer_pattern = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.")
+    for name, tensor in state_dict.items():
+        match = layer_pattern.search(name)
+        if match is not None:
+            layer_ids.add(int(match.group(1)))
+        if not torch.is_tensor(tensor) or tensor.ndim != 2:
+            continue
+        shape = tuple(int(x) for x in tensor.shape)
+        if (
+            dim is None
+            and (
+                name.endswith("embed_tokens.weight")
+                or name.endswith("tok_embeddings.weight")
+                or name == "wte.weight"
+            )
+        ):
+            vocab_size, dim = shape
+        if (
+            q_out_dim is None
+            and (
+                name.endswith("self_attn.q_proj.weight")
+                or name.endswith("attention.wq.weight")
+            )
+        ):
+            q_out_dim, dim = shape
+        if (
+            kv_out_dim is None
+            and (
+                name.endswith("self_attn.k_proj.weight")
+                or name.endswith("attention.wk.weight")
+            )
+        ):
+            kv_out_dim = shape[0]
+
+    return {
+        "dim": dim,
+        "vocab_size": vocab_size,
+        "q_out_dim": q_out_dim,
+        "kv_out_dim": kv_out_dim,
+        "n_layers": (max(layer_ids) + 1) if layer_ids else None,
+    }
+
+
+def _model_args_signature(model_args: object) -> dict[str, int | None]:
+    dim = _get_attr_any(model_args, ("dim", "hidden_size", "n_embd"))
+    n_layers = _get_attr_any(model_args, ("n_layers", "num_hidden_layers"))
+    n_heads = _get_attr_any(model_args, ("n_heads", "num_attention_heads"))
+    n_kv_heads = _get_attr_any(
+        model_args, ("n_kv_heads", "num_key_value_heads", "n_heads")
+    )
+    vocab_size = _get_attr_any(model_args, ("vocab_size",))
+    kv_out_dim = None
+    if dim is not None and n_heads not in (None, 0) and n_kv_heads is not None:
+        kv_out_dim = dim * n_kv_heads // n_heads
+    return {
+        "dim": dim,
+        "vocab_size": vocab_size,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "kv_out_dim": kv_out_dim,
+    }
+
+
+def _model_args_match_state_dict(
+    model_args: object, state_sig: dict[str, int | None]
+) -> bool:
+    args_sig = _model_args_signature(model_args)
+    for key in ("dim", "n_layers", "kv_out_dim"):
+        state_value = state_sig.get(key)
+        args_value = args_sig.get(key)
+        if (
+            state_value is not None
+            and args_value is not None
+            and state_value != args_value
+        ):
+            return False
+    q_out_dim = state_sig.get("q_out_dim")
+    args_dim = args_sig.get("dim")
+    if q_out_dim is not None and args_dim is not None and q_out_dim != args_dim:
+        return False
+    return True
+
+
+def _format_signature(sig: dict[str, int | None]) -> str:
+    return ", ".join(
+        f"{key}={value}" for key, value in sig.items() if value is not None
+    )
+
+
+def _resolve_torchtitan_model_args_key(
+    train_spec: Any,
+    state_dict: dict[str, torch.Tensor],
+    requested_key: str,
+) -> str:
+    """Resolve TorchTitan model args against actual state_dict shapes."""
+    model_args_map = train_spec.model_args
+    state_sig = _state_dict_signature(state_dict)
+    requested_key = requested_key.strip()
+    auto_requested = requested_key.lower() in {"", "auto"}
+
+    if not auto_requested:
+        if requested_key not in model_args_map:
+            available = ", ".join(sorted(str(key) for key in model_args_map))
+            raise KeyError(
+                f"Unknown TorchTitan model args key '{requested_key}'. "
+                f"Available keys: {available}"
+            )
+        if _model_args_match_state_dict(model_args_map[requested_key], state_sig):
+            return requested_key
+
+    matches = [
+        str(key)
+        for key, model_args in model_args_map.items()
+        if _model_args_match_state_dict(model_args, state_sig)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    state_text = _format_signature(state_sig) or "unknown"
+    candidates = ", ".join(
+        f"{key}({_format_signature(_model_args_signature(model_args))})"
+        for key, model_args in model_args_map.items()
+    )
+    if auto_requested:
+        raise ValueError(
+            "Could not infer a unique TorchTitan model args key from the "
+            f"state_dict shape ({state_text}). Matching keys: {matches or 'none'}. "
+            f"Available keys: {candidates}"
+        )
+    requested_sig = _format_signature(
+        _model_args_signature(model_args_map[requested_key])
+    )
+    raise ValueError(
+        f"Configured trainer.torchtitan.dcp-model-args='{requested_key}' does not "
+        f"match the incoming state_dict shape ({state_text}). "
+        f"Requested key shape: {requested_sig}. "
+        f"Auto-detected matches: {matches or 'none'}. "
+        "Set trainer.torchtitan.dcp-model-args to the matching TorchTitan key, "
+        "or use 'auto' when exactly one key matches."
+    )
+
+
 def _remove_path(path: str) -> None:
     """Remove a file, symlink, or directory if present."""
     if os.path.islink(path) or os.path.isfile(path):
@@ -289,7 +450,18 @@ def _save_state_dict_as_dcp(
     train_spec = train_spec_module.get_train_spec(train_spec_name)
     model_args = train_spec.model_args[model_args_key]
     sd_adapter = train_spec.state_dict_adapter(model_args, None)
-    titan_state_dict = sd_adapter.from_hf(state_dict)
+    try:
+        titan_state_dict = sd_adapter.from_hf(state_dict)
+    except Exception as exc:
+        state_text = _format_signature(_state_dict_signature(state_dict)) or "unknown"
+        args_text = _format_signature(_model_args_signature(model_args)) or "unknown"
+        raise RuntimeError(
+            "TorchTitan HF-to-DCP conversion failed with "
+            f"dcp-train-spec='{train_spec_name}', "
+            f"dcp-model-args='{model_args_key}'. "
+            f"Incoming state_dict shape: {state_text}. "
+            f"TorchTitan model args shape: {args_text}."
+        ) from exc
     dcp.save(titan_state_dict, storage_writer=writer)
 
 
@@ -314,7 +486,16 @@ def _load_state_dict_from_dcp(
     train_spec = train_spec_module.get_train_spec(train_spec_name)
     model_args = train_spec.model_args[model_args_key]
     sd_adapter = train_spec.state_dict_adapter(model_args, None)
-    hf_state = sd_adapter.to_hf(checkpoint_dict)
+    try:
+        hf_state = sd_adapter.to_hf(checkpoint_dict)
+    except Exception as exc:
+        args_text = _format_signature(_model_args_signature(model_args)) or "unknown"
+        raise RuntimeError(
+            "TorchTitan DCP-to-HF conversion failed with "
+            f"dcp-train-spec='{train_spec_name}', "
+            f"dcp-model-args='{model_args_key}'. "
+            f"TorchTitan model args shape: {args_text}."
+        ) from exc
     return _normalize_state_dict_for_hf(extract_state_dict(hf_state))
 
 
@@ -360,7 +541,7 @@ def run_torchtitan_training(
         _config_value(
             context,
             "trainer.torchtitan.dcp-model-args",
-            _config_value(context, "trainer.torchtitan.dcp_model_args", "8B"),
+            _config_value(context, "trainer.torchtitan.dcp_model_args", "auto"),
         )
     ).strip()
     dcp_threads = int(
@@ -428,9 +609,20 @@ def run_torchtitan_training(
     if not workdir:
         workdir = client_workspace
     os.makedirs(dump_folder, exist_ok=True)
+    resolved_dcp_model_args = dcp_model_args
+    if dcp_enabled:
+        try:
+            import torchtitan.protocols.train_spec as train_spec_module
+        except Exception:
+            pass
+        else:
+            train_spec = train_spec_module.get_train_spec(dcp_train_spec)
+            resolved_dcp_model_args = _resolve_torchtitan_model_args_key(
+                train_spec, state_dict, dcp_model_args
+            )
     model_cache_path = _sanitize_model_cache_path(
         model_name,
-        f"{dcp_train_spec}-{dcp_model_args}",
+        f"{dcp_train_spec}-{resolved_dcp_model_args}",
     )
     dcp_cache_dir = os.path.join(
         client_workspace, "flower_dcp_cache", model_cache_path
@@ -469,6 +661,8 @@ def run_torchtitan_training(
         "client_name": client_name,
         "model_name": model_name,
         "model_flavor": model_flavor,
+        "dcp_train_spec": dcp_train_spec,
+        "dcp_model_args": resolved_dcp_model_args,
         "hf_assets_path": hf_assets_path,
         "dataset_name": dataset_name,
         "dataset_path": dataset_path,
@@ -613,7 +807,7 @@ def run_torchtitan_training(
                 state_dict,
                 conversion_dir,
                 train_spec_name=dcp_train_spec,
-                model_args_key=dcp_model_args,
+                model_args_key=resolved_dcp_model_args,
                 dcp_threads=dcp_threads,
             )
             if conversion_dir == dcp_cache_dir:
@@ -702,7 +896,7 @@ def run_torchtitan_training(
         return _load_state_dict_from_dcp(
             output_dcp_dir,
             train_spec_name=dcp_train_spec,
-            model_args_key=dcp_model_args,
+            model_args_key=resolved_dcp_model_args,
         )
 
     if os.path.islink(output_dcp_dir):

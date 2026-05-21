@@ -39,9 +39,10 @@ fi
 
 {{ torchtitan_command }}
 
-if [ -d "${FLWR_TORCHTITAN_FINAL_DCP_DIR}" ]; then
-  if [ -e "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}" ] || [ -L "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}" ]; then
-    rm -rf "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}"
+if [ -d "${FLWR_TORCHTITAN_INPUT_DCP_DIR}" ]; then
+  if [ ! -d "${FLWR_TORCHTITAN_FINAL_DCP_DIR}" ]; then
+    echo "Expected TorchTitan DCP checkpoint not found: ${FLWR_TORCHTITAN_FINAL_DCP_DIR}" >&2
+    exit 1
   fi
   mv "${FLWR_TORCHTITAN_FINAL_DCP_DIR}" "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}"
 fi
