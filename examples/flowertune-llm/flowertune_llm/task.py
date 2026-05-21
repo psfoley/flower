@@ -7,6 +7,7 @@ import os
 import pickle
 import re
 import shlex
+import shutil
 import subprocess
 from textwrap import dedent
 from typing import Any
@@ -88,6 +89,36 @@ def training_disabled(context: Context) -> bool:
 
 def sanitize_layer_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+
+
+def _sanitize_model_cache_path(model_name: str, fallback: str) -> str:
+    """Return a safe relative cache path for a model name/repo id."""
+    parts = [
+        sanitize_layer_name(part)
+        for part in re.split(r"[\\/]+", model_name.strip())
+        if part not in {"", ".", ".."}
+    ]
+    parts = [part for part in parts if part]
+    if not parts:
+        return sanitize_layer_name(fallback)
+    return os.path.join(*parts)
+
+
+def _dcp_checkpoint_exists(path: str) -> bool:
+    return os.path.isdir(path) and os.path.exists(os.path.join(path, ".metadata"))
+
+
+def _remove_path(path: str) -> None:
+    """Remove a file, symlink, or directory if present."""
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _replace_symlink(link_path: str, target_path: str) -> None:
+    _remove_path(link_path)
+    os.symlink(target_path, link_path, target_is_directory=True)
 
 
 def chunk_key(layer_name: str, start: int, end: int) -> str:
@@ -291,12 +322,19 @@ def run_torchtitan_training(
     cfg: DictConfig,
     context: Context,
     state_dict: dict[str, torch.Tensor],
+    *,
+    server_round: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Execute TorchTitan training command and load the updated state_dict."""
     trainer_cfg = getattr(cfg, "trainer", {})
     titan_cfg = getattr(trainer_cfg, "torchtitan", {})
     command = str(getattr(titan_cfg, "command", "")).strip()
 
+    round_id = (
+        int(server_round)
+        if server_round is not None
+        else int(_config_value(context, "current-round", 0))
+    )
     output_dir = os.path.join(layer_dir(context), "torchtitan")
     os.makedirs(output_dir, exist_ok=True)
     input_state_path = os.path.join(output_dir, "input_state.pt")
@@ -332,16 +370,6 @@ def run_torchtitan_training(
             _config_value(context, "trainer.torchtitan.dcp_threads", 8),
         )
     )
-    env = os.environ.copy()
-    scheduler_env = {
-        "FLWR_TORCHTITAN_INPUT_STATE": input_state_path,
-        "FLWR_TORCHTITAN_OUTPUT_STATE": output_state_path,
-        "FLWR_TORCHTITAN_INPUT_DCP_DIR": input_dcp_dir,
-        "FLWR_TORCHTITAN_OUTPUT_DCP_DIR": output_dcp_dir,
-        "FLWR_RUN_ID": str(context.run_id),
-        "FLWR_NODE_ID": str(context.node_id),
-    }
-    env.update(scheduler_env)
 
     workdir = str(getattr(titan_cfg, "workdir", "")).strip() or None
     scheduler_backend = str(
@@ -355,7 +383,6 @@ def run_torchtitan_training(
         ),
         default=False,
     )
-    round_id = int(_config_value(context, "current-round", 0))
     client_name = _config_str(context, "client.name", str(context.node_id))
     dataset_name = _config_str(
         context, "client.dataset-name", _config_str(context, "dataset.name", "")
@@ -378,6 +405,9 @@ def run_torchtitan_training(
         "client.workspace",
         workdir or os.getcwd(),
     )
+    client_workspace = os.path.abspath(
+        os.path.expandvars(os.path.expanduser(client_workspace))
+    )
     dump_folder = _config_str(
         context,
         "trainer.dump-folder",
@@ -398,6 +428,30 @@ def run_torchtitan_training(
     if not workdir:
         workdir = client_workspace
     os.makedirs(dump_folder, exist_ok=True)
+    model_cache_path = _sanitize_model_cache_path(
+        model_name,
+        f"{dcp_train_spec}-{dcp_model_args}",
+    )
+    dcp_cache_dir = os.path.join(
+        client_workspace, "flower_dcp_cache", model_cache_path
+    )
+    checkpoint_dir = os.path.join(dump_folder, "checkpoint")
+    step0_dcp_dir = os.path.join(checkpoint_dir, "step-0")
+    final_dcp_dir = os.path.join(checkpoint_dir, f"step-{train_steps}")
+    env = os.environ.copy()
+    scheduler_env = {
+        "FLWR_TORCHTITAN_INPUT_STATE": input_state_path,
+        "FLWR_TORCHTITAN_OUTPUT_STATE": output_state_path,
+        "FLWR_TORCHTITAN_INPUT_DCP_DIR": input_dcp_dir,
+        "FLWR_TORCHTITAN_OUTPUT_DCP_DIR": output_dcp_dir,
+        "FLWR_TORCHTITAN_DCP_CACHE_DIR": dcp_cache_dir,
+        "FLWR_TORCHTITAN_CHECKPOINT_DIR": checkpoint_dir,
+        "FLWR_TORCHTITAN_STEP0_DCP_DIR": step0_dcp_dir,
+        "FLWR_TORCHTITAN_FINAL_DCP_DIR": final_dcp_dir,
+        "FLWR_RUN_ID": str(context.run_id),
+        "FLWR_NODE_ID": str(context.node_id),
+    }
+    env.update(scheduler_env)
     scheduler_account = _config_str(context, "scheduler.account", "")
     scheduler_partition = _config_str(context, "scheduler.partition", "")
     scheduler_qos = _config_str(context, "scheduler.qos", "")
@@ -424,6 +478,10 @@ def run_torchtitan_training(
         "output_checkpoint_path": output_state_path,
         "input_dcp_dir": input_dcp_dir,
         "output_dcp_dir": output_dcp_dir,
+        "dcp_cache_dir": dcp_cache_dir,
+        "checkpoint_dir": checkpoint_dir,
+        "step0_dcp_dir": step0_dcp_dir,
+        "final_dcp_dir": final_dcp_dir,
         "work_dir": output_dir,
         "client_workspace": client_workspace,
         "dump_folder": dump_folder,
@@ -544,15 +602,24 @@ def run_torchtitan_training(
             "scheduler.flux.script-template containing the training command."
         )
 
-    torch.save(state_dict, input_state_path)
     if dcp_enabled:
-        _save_state_dict_as_dcp(
-            state_dict,
-            input_dcp_dir,
-            train_spec_name=dcp_train_spec,
-            model_args_key=dcp_model_args,
-            dcp_threads=dcp_threads,
-        )
+        _remove_path(output_dcp_dir)
+        if round_id <= 1 and _dcp_checkpoint_exists(dcp_cache_dir):
+            _replace_symlink(input_dcp_dir, dcp_cache_dir)
+        else:
+            conversion_dir = dcp_cache_dir if round_id <= 1 else input_dcp_dir
+            _remove_path(conversion_dir)
+            _save_state_dict_as_dcp(
+                state_dict,
+                conversion_dir,
+                train_spec_name=dcp_train_spec,
+                model_args_key=dcp_model_args,
+                dcp_threads=dcp_threads,
+            )
+            if conversion_dir == dcp_cache_dir:
+                _replace_symlink(input_dcp_dir, dcp_cache_dir)
+    else:
+        torch.save(state_dict, input_state_path)
 
     if scheduler_backend in {"", "none", "local"}:
         result = run_local()

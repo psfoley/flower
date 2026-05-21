@@ -11,6 +11,10 @@ export FLWR_TORCHTITAN_INPUT_STATE="{{ input_checkpoint_path }}"
 export FLWR_TORCHTITAN_OUTPUT_STATE="{{ output_checkpoint_path }}"
 export FLWR_TORCHTITAN_INPUT_DCP_DIR="{{ input_dcp_dir }}"
 export FLWR_TORCHTITAN_OUTPUT_DCP_DIR="{{ output_dcp_dir }}"
+export FLWR_TORCHTITAN_DCP_CACHE_DIR="{{ dcp_cache_dir }}"
+export FLWR_TORCHTITAN_CHECKPOINT_DIR="{{ checkpoint_dir }}"
+export FLWR_TORCHTITAN_STEP0_DCP_DIR="{{ step0_dcp_dir }}"
+export FLWR_TORCHTITAN_FINAL_DCP_DIR="{{ final_dcp_dir }}"
 export FLWR_RUN_ID="{{ run_id }}"
 export FLWR_NODE_ID="{{ node_id }}"
 export FLWR_CLIENT_NAME="{{ client_name }}"
@@ -25,4 +29,19 @@ export FLWR_NUM_NODES="{{ num_nodes }}"
 export FLWR_TORCHTITAN_CONFIG_FILENAME="{{ config_filename }}"
 export FLWR_TORCHTITAN_CONFIG_PATH="{{ torchtitan_config_path }}"
 
+if [ -d "${FLWR_TORCHTITAN_INPUT_DCP_DIR}" ]; then
+  mkdir -p "${FLWR_TORCHTITAN_CHECKPOINT_DIR}"
+  if [ -e "${FLWR_TORCHTITAN_STEP0_DCP_DIR}" ] || [ -L "${FLWR_TORCHTITAN_STEP0_DCP_DIR}" ]; then
+    rm -rf "${FLWR_TORCHTITAN_STEP0_DCP_DIR}"
+  fi
+  ln -s "${FLWR_TORCHTITAN_INPUT_DCP_DIR}" "${FLWR_TORCHTITAN_STEP0_DCP_DIR}"
+fi
+
 {{ torchtitan_command }}
+
+if [ -d "${FLWR_TORCHTITAN_FINAL_DCP_DIR}" ]; then
+  if [ -e "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}" ] || [ -L "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}" ]; then
+    rm -rf "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}"
+  fi
+  mv "${FLWR_TORCHTITAN_FINAL_DCP_DIR}" "${FLWR_TORCHTITAN_OUTPUT_DCP_DIR}"
+fi

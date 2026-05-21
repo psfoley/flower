@@ -318,8 +318,18 @@ def train(msg: Message, context: Context):
     if incoming_state is not None:
         model.load_state_dict(incoming_state, strict=True)
 
+    server_round = None
+    if msg.content and "config" in msg.content:
+        config = msg.content["config"]
+        if "server-round" in config:
+            server_round = int(config["server-round"])
+        elif "current-round" in config:
+            server_round = int(config["current-round"])
+
     if trainer_backend == "torchtitan":
-        trained_state = run_torchtitan_training(cfg, context, model.state_dict())
+        trained_state = run_torchtitan_training(
+            cfg, context, model.state_dict(), server_round=server_round
+        )
         model.load_state_dict(trained_state, strict=False)
     elif trainer_backend != "none":
         raise ValueError(f"Unsupported trainer.backend: {trainer_backend}")
