@@ -30,6 +30,7 @@ from flowertune_llm.task import (
     run_torchtitan_training,
     sanitize_layer_name,
     shape_from_text,
+    state_dict_fingerprint,
     training_disabled,
 )
 
@@ -50,6 +51,47 @@ app = ClientApp()
 
 _DOWNLOAD_LAYER_CACHE: dict[tuple[int, int, str], CachedLayer] = {}
 _COMMS_LAYER_CACHE: dict[tuple[int, int, str], CachedLayer] = {}
+
+
+def _layer_file_path(context: Context, layer_name: str) -> str:
+    return os.path.join(layer_dir(context), f"{sanitize_layer_name(layer_name)}.pt")
+
+
+def _restore_layer_state_from_names(
+    context: Context,
+    layer_names: list[str],
+    *,
+    require_all: bool,
+) -> None:
+    """Restore layer-wise context state from deterministic layer file paths."""
+    if not layer_names:
+        return
+
+    layer_paths = [_layer_file_path(context, layer_name) for layer_name in layer_names]
+    missing = [path for path in layer_paths if not os.path.exists(path)]
+    if missing and require_all:
+        preview = ", ".join(missing[:3])
+        suffix = "" if len(missing) <= 3 else f" and {len(missing) - 3} more"
+        raise FileNotFoundError(
+            "Layer-wise model was marked as preloaded, but expected layer files "
+            f"were not found: {preview}{suffix}"
+        )
+    existing_pairs = [
+        (layer_name, layer_path)
+        for layer_name, layer_path in zip(layer_names, layer_paths, strict=True)
+        if os.path.exists(layer_path)
+    ]
+    if not existing_pairs:
+        return
+
+    context.state[STATE_LAYER_NAMES] = ConfigRecord(
+        {"names": [name for name, _ in existing_pairs]}
+    )
+    context.state[STATE_LAYER_PATHS] = ConfigRecord(
+        {"paths": [path for _, path in existing_pairs]}
+    )
+    context.state[STATE_LAYER_IDX] = ConfigRecord({"idx": 0})
+    context.state[STATE_NUM_EXAMPLES] = ConfigRecord({"num_examples": 1})
 
 
 def _flush_download_caches_for_context(context: Context) -> None:
@@ -228,6 +270,18 @@ def train(msg: Message, context: Context):
         and "config" in msg.content
         and msg.content["config"].get("model_preloaded", False)
     )
+    config = msg.content["config"] if msg.content and "config" in msg.content else {}
+    if (
+        aggregation_mode != "all_at_once"
+        and model_preloaded
+        and STATE_LAYER_PATHS not in context.state
+        and "layer_names" in config
+    ):
+        _restore_layer_state_from_names(
+            context,
+            [str(layer_name) for layer_name in list(config["layer_names"])],
+            require_all=True,
+        )
 
     # If layerwise model was streamed from server already, skip full model load.
     if (
@@ -252,7 +306,10 @@ def train(msg: Message, context: Context):
                 "profile.client.train.ms": (t1 - t0) * 1000.0,
             }
         )
-        return Message(content=RecordDict({"arrays": ArrayRecord(), "metrics": metrics}), reply_to=msg)
+        return Message(
+            content=RecordDict({"arrays": ArrayRecord(), "metrics": metrics}),
+            reply_to=msg,
+        )
 
     incoming_state: dict[str, torch.Tensor] | None = None
     if msg.content and "arrays" in msg.content:
@@ -263,11 +320,20 @@ def train(msg: Message, context: Context):
         and STATE_LAYER_PATHS in context.state
     ):
         incoming_state = load_state_dict_from_layer_files(context)
+    elif aggregation_mode != "all_at_once" and model_preloaded:
+        raise FileNotFoundError(
+            "Layer-wise model was marked as preloaded, but no layer files were "
+            "available to load for training."
+        )
 
     if disable_train:
         # Keep communication path alive without invoking local training workloads.
         if aggregation_mode == "all_at_once":
-            arrays_out = ArrayRecord(incoming_state) if incoming_state is not None else ArrayRecord()
+            arrays_out = (
+                ArrayRecord(incoming_state)
+                if incoming_state is not None
+                else ArrayRecord()
+            )
             t1 = perf_counter()
             metrics = MetricRecord(
                 {
@@ -317,6 +383,7 @@ def train(msg: Message, context: Context):
     model = get_model(cfg.model)
     if incoming_state is not None:
         model.load_state_dict(incoming_state, strict=True)
+    input_fingerprint = state_dict_fingerprint(model.state_dict())
 
     server_round = None
     if msg.content and "config" in msg.content:
@@ -335,11 +402,10 @@ def train(msg: Message, context: Context):
         raise ValueError(f"Unsupported trainer.backend: {trainer_backend}")
 
     state_dict = model.state_dict()
+    output_fingerprint = state_dict_fingerprint(state_dict)
     layer_names = list(state_dict.keys())
-    if msg.content and "config" in msg.content:
-        config = msg.content["config"]
-        if "layer_names" in config:
-            layer_names = list(config["layer_names"])
+    if "layer_names" in config:
+        layer_names = list(config["layer_names"])
 
     # Persist layers to disk for per-layer sending and track in context state.
     _persist_layer_files(context, state_dict, layer_names)
@@ -349,6 +415,9 @@ def train(msg: Message, context: Context):
         "train_loss": 0.0,
         "num-examples": 1,
         "profile.client.train.ms": (t1 - t0) * 1000.0,
+        "model.input_fingerprint": input_fingerprint,
+        "model.output_fingerprint": output_fingerprint,
+        "model.fingerprint_delta": output_fingerprint - input_fingerprint,
     }
 
     metric_record = MetricRecord(metrics)
@@ -367,31 +436,11 @@ def train_comms(msg: Message, context: Context):
     config = msg.content["config"] if msg.content and "config" in msg.content else {}
     chunk_ranges = parse_chunk_ranges(config)
     usechunk_keys = "chunk_starts" in config and "chunk_ends" in config
-
-    if STATE_LAYER_PATHS not in context.state:
-        return Message(
-            content=RecordDict(
-                {
-                    "arrays": ArrayRecord(),
-                    "metrics": MetricRecord({"num-examples": 1}),
-                    "config": ConfigRecord({"send_complete": True}),
-                }
-            ),
-            reply_to=msg,
-        )
-
-    layer_paths = list(context.state[STATE_LAYER_PATHS]["paths"])
-    if not layer_paths:
-        return Message(
-            content=RecordDict(
-                {
-                    "arrays": ArrayRecord(),
-                    "metrics": MetricRecord({"num-examples": 1}),
-                    "config": ConfigRecord({"send_complete": True}),
-                }
-            ),
-            reply_to=msg,
-        )
+    layer_paths = (
+        list(context.state[STATE_LAYER_PATHS]["paths"])
+        if STATE_LAYER_PATHS in context.state
+        else []
+    )
 
     arrays: dict[str, torch.Tensor] = {}
     entries: list[tuple[int, str, int, int, bool]] = []
@@ -427,19 +476,32 @@ def train_comms(msg: Message, context: Context):
         if not chunk_ranges:
             chunk_ranges = [(0, 0)]
         for start, end in chunk_ranges:
-            entries.append((layer_idx, expected_layer_name, start, end, is_last_batch(config)))
+            entries.append(
+                (layer_idx, expected_layer_name, start, end, is_last_batch(config))
+            )
 
     if not entries:
         entries = [(0, "", 0, 0, True)]
 
     for layer_idx, expected_layer_name, start, end, is_last_chunk in entries:
-        if layer_idx >= len(layer_paths):
-            layer_idx = len(layer_paths) - 1
-        layer_path = layer_paths[layer_idx]
+        layer_path = ""
+        if layer_paths:
+            if layer_idx >= len(layer_paths):
+                layer_idx = len(layer_paths) - 1
+            layer_path = layer_paths[layer_idx]
         if not expected_layer_name and STATE_LAYER_NAMES in context.state:
             layer_names = list(context.state[STATE_LAYER_NAMES]["names"])
             if layer_idx < len(layer_names):
                 expected_layer_name = str(layer_names[layer_idx])
+        if not layer_path and expected_layer_name:
+            layer_path = _layer_file_path(context, expected_layer_name)
+        if not layer_path:
+            continue
+        if not os.path.exists(layer_path):
+            raise FileNotFoundError(
+                "Expected layer file for layer-wise upload was not found: "
+                f"{layer_path}"
+            )
 
         cache_key = context_path_key(context, layer_path)
         cached = _COMMS_LAYER_CACHE.get(cache_key)
@@ -490,11 +552,16 @@ def train_comms(msg: Message, context: Context):
 
     final_layer_idx, _, _, _, final_is_last_chunk = entries[-1]
     send_complete = (
-        final_layer_idx >= (len(layer_paths) - 1)
+        bool(layer_paths)
+        and final_layer_idx >= (len(layer_paths) - 1)
         and final_is_last_chunk
     )
 
-    num_examples = int(context.state[STATE_NUM_EXAMPLES]["num_examples"])
+    num_examples = (
+        int(context.state[STATE_NUM_EXAMPLES]["num_examples"])
+        if STATE_NUM_EXAMPLES in context.state
+        else 1
+    )
     metric_record = MetricRecord({"num-examples": num_examples})
 
     t1 = perf_counter()

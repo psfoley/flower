@@ -52,6 +52,8 @@ from flwr.serverapp.strategy.strategy_utils import (
     sample_nodes,
 )
 
+from flowertune_llm.task import state_dict_fingerprint
+
 SAFE_GRPC_BYTES = int(GRPC_MAX_MESSAGE_LENGTH * 0.75)
 
 
@@ -481,6 +483,13 @@ class FedAvgStreaming(FedAvg):
             log(INFO, "")
             log(INFO, "[ROUND %s/%s]", current_round, num_rounds)
             aggregation_mode = train_config.get("aggregation.mode", "layerwise")
+            server_input_fingerprint = state_dict_fingerprint(state_dict)
+            log(
+                INFO,
+                "[Model fingerprint] round %s server before train: %.12g",
+                current_round,
+                server_input_fingerprint,
+            )
 
             # In all_at_once mode, send the current global model each round.
             # Using `initial_arrays` here would resend stale/empty arrays.
@@ -782,6 +791,15 @@ class FedAvgStreaming(FedAvg):
                     for layer_name, agg_tensor in aggregated_layers.items():
                         state_dict[layer_name] = agg_tensor
                     aggregated_layers.clear()
+
+            server_output_fingerprint = state_dict_fingerprint(state_dict)
+            log(
+                INFO,
+                "[Model fingerprint] round %s server after aggregation: %.12g (delta %.12g)",
+                current_round,
+                server_output_fingerprint,
+                server_output_fingerprint - server_input_fingerprint,
+            )
 
             # -----------------------------------------------------------------
             # --- EVALUATION (CLIENTAPP-SIDE) ---------------------------------

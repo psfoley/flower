@@ -216,6 +216,50 @@ def _format_signature(sig: dict[str, int | None]) -> str:
     )
 
 
+def state_dict_fingerprint(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    max_tensors: int = 8,
+) -> float:
+    """Return a cheap numeric fingerprint from a few tensor scalar samples."""
+    max_tensors = max(1, int(max_tensors))
+    tensor_names = sorted(
+        name for name, tensor in state_dict.items() if torch.is_tensor(tensor)
+    )
+    if not tensor_names:
+        return 0.0
+
+    if len(tensor_names) <= max_tensors:
+        selected_names = tensor_names
+    elif max_tensors == 1:
+        selected_names = [tensor_names[0]]
+    else:
+        selected_indices = {
+            round(idx * (len(tensor_names) - 1) / (max_tensors - 1))
+            for idx in range(max_tensors)
+        }
+        selected_names = [tensor_names[idx] for idx in sorted(selected_indices)]
+
+    fingerprint = 0.0
+    for name_idx, name in enumerate(selected_names, start=1):
+        tensor = state_dict[name]
+        if tensor.numel() == 0:
+            continue
+        detached = tensor.detach()
+        try:
+            flat = detached.view(-1)
+        except RuntimeError:
+            continue
+        sample_indices = {0, flat.numel() // 2, flat.numel() - 1}
+        for sample_idx in sorted(sample_indices):
+            try:
+                value = float(flat[sample_idx].float().item())
+            except (NotImplementedError, RuntimeError, TypeError, ValueError):
+                continue
+            fingerprint += value * (name_idx * 1009 + sample_idx % 997)
+    return float(fingerprint)
+
+
 def _resolve_torchtitan_model_args_key(
     train_spec: Any,
     state_dict: dict[str, torch.Tensor],
