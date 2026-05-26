@@ -472,6 +472,50 @@ def _normalize_state_dict_for_hf(
     }
 
 
+def _empty_like_tensor_structure(value: Any) -> Any:
+    """Clone a checkpoint structure with empty CPU tensors for DCP loading."""
+    if torch.is_tensor(value):
+        return torch.empty_like(value.detach(), device="cpu")
+    if isinstance(value, dict):
+        return {
+            key: _empty_like_tensor_structure(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _dcp_load_into(state_dict: dict[str, Any], reader: Any) -> None:
+    """Load a DCP state_dict across PyTorch versions."""
+    from torch.distributed import checkpoint as dcp
+
+    try:
+        dcp.load(state_dict, storage_reader=reader, no_dist=True)
+    except TypeError as exc:
+        if "no_dist" not in str(exc):
+            raise
+        dcp.load(state_dict, storage_reader=reader)
+
+
+def _load_first_matching_dcp_state(
+    input_dir: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Load DCP into the first candidate structure matching checkpoint keys."""
+    from torch.distributed import checkpoint as dcp
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    last_error: CheckpointException | None = None
+    for candidate in candidates:
+        try:
+            _dcp_load_into(candidate, dcp.filesystem.FileSystemReader(input_dir))
+            return candidate
+        except CheckpointException as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError(f"No DCP load candidates provided for {input_dir}")
+
+
 def _save_state_dict_as_dcp(
     state_dict: dict[str, torch.Tensor],
     output_dir: str,
@@ -514,24 +558,44 @@ def _load_state_dict_from_dcp(
     *,
     train_spec_name: str,
     model_args_key: str,
+    reference_state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     """Load state_dict from DCP format, converting back to HF-like mapping."""
-    from torch.distributed import checkpoint as dcp
-
-    reader = dcp.filesystem.FileSystemReader(input_dir)
-    checkpoint_dict: dict[str, Any] = {}
-    dcp.load(checkpoint_dict, storage_reader=reader, no_dist=True)
+    reference_hf_state = _normalize_state_dict_for_hf(reference_state_dict)
 
     try:
         import torchtitan.protocols.train_spec as train_spec_module
     except Exception:
-        return _normalize_state_dict_for_hf(extract_state_dict(checkpoint_dict))
+        checkpoint_dict = _load_first_matching_dcp_state(
+            input_dir,
+            [
+                _empty_like_tensor_structure(reference_hf_state),
+                {"model": _empty_like_tensor_structure(reference_hf_state)},
+            ],
+        )
+        loaded_state = _normalize_state_dict_for_hf(extract_state_dict(checkpoint_dict))
+        if not loaded_state:
+            raise ValueError(f"DCP checkpoint loaded no tensors from {input_dir}")
+        return loaded_state
 
     train_spec = train_spec_module.get_train_spec(train_spec_name)
     model_args = train_spec.model_args[model_args_key]
     sd_adapter = train_spec.state_dict_adapter(model_args, None)
+    titan_reference = sd_adapter.from_hf(reference_hf_state)
+    checkpoint_dict = _load_first_matching_dcp_state(
+        input_dir,
+        [
+            _empty_like_tensor_structure(titan_reference),
+            {"model": _empty_like_tensor_structure(titan_reference)},
+        ],
+    )
+    titan_state = (
+        checkpoint_dict["model"]
+        if isinstance(checkpoint_dict.get("model"), dict)
+        else checkpoint_dict
+    )
     try:
-        hf_state = sd_adapter.to_hf(checkpoint_dict)
+        hf_state = sd_adapter.to_hf(titan_state)
     except Exception as exc:
         args_text = _format_signature(_model_args_signature(model_args)) or "unknown"
         raise RuntimeError(
@@ -540,7 +604,10 @@ def _load_state_dict_from_dcp(
             f"dcp-model-args='{model_args_key}'. "
             f"TorchTitan model args shape: {args_text}."
         ) from exc
-    return _normalize_state_dict_for_hf(extract_state_dict(hf_state))
+    loaded_state = _normalize_state_dict_for_hf(extract_state_dict(hf_state))
+    if not loaded_state:
+        raise ValueError(f"DCP checkpoint loaded no tensors from {input_dir}")
+    return loaded_state
 
 
 def run_torchtitan_training(
@@ -941,6 +1008,7 @@ def run_torchtitan_training(
             output_dcp_dir,
             train_spec_name=dcp_train_spec,
             model_args_key=resolved_dcp_model_args,
+            reference_state_dict=state_dict,
         )
 
     if os.path.islink(output_dcp_dir):

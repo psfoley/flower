@@ -397,7 +397,7 @@ def train(msg: Message, context: Context):
         trained_state = run_torchtitan_training(
             cfg, context, model.state_dict(), server_round=server_round
         )
-        model.load_state_dict(trained_state, strict=False)
+        model.load_state_dict(trained_state, strict=True)
     elif trainer_backend != "none":
         raise ValueError(f"Unsupported trainer.backend: {trainer_backend}")
 
