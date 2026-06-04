@@ -135,6 +135,10 @@ flower-supernode --insecure --superlink <SUPERLINK_HOST:9092> \
   --node-config "scheduler.backend='flux' scheduler.flux.run-command='flux run' scheduler.flux.extra-args='-N1 -n1 -g1'"
 ```
 
+Use `flux run` for `scheduler.flux.run-command`. `flux batch` submits a
+batch job asynchronously, but the Flower client waits for TorchTitan to finish
+and write `FLWR_TORCHTITAN_OUTPUT_DCP_DIR` before returning from training.
+
 #### Template-based Script Generation
 
 The scheduler script and TorchTitan config can be generated from templates:

@@ -979,6 +979,17 @@ def run_torchtitan_training(
             _config_value(context, "scheduler.flux.extra-args", "")
         ).strip()
         flux_parts = shlex.split(flux_run)
+        if (
+            len(flux_parts) >= 2
+            and os.path.basename(flux_parts[0]) == "flux"
+            and flux_parts[1] == "batch"
+        ):
+            raise ValueError(
+                "scheduler.flux.run-command must run the generated script in "
+                "the foreground, for example 'flux run'. 'flux batch' submits "
+                "asynchronously, so Flower cannot wait for TorchTitan to write "
+                "FLWR_TORCHTITAN_OUTPUT_DCP_DIR."
+            )
         if scheduler_extra_args:
             flux_parts.extend(shlex.split(scheduler_extra_args))
         if flux_extra_args:
