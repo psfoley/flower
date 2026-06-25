@@ -104,6 +104,11 @@ flwr run . --run-config "aggregation.mode='layerwise'"
 flwr run . --run-config "aggregation.mode='all_at_once'"
 ```
 
+Layer-wise aggregation batches chunks up to `aggregation.upload-target-message-size`
+and `aggregation.download-target-message-size`. Keep
+`aggregation.chunks-per-message=0` unless you intentionally want to cap the
+number of chunks in each message.
+
 You can also target the base model ID if available in your environment:
 `meta-llama/Meta-Llama-3.1-70B`.
 

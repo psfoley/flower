@@ -109,6 +109,7 @@ def _build_layer_chunk_entries(
         cpu_tensor = tensor.detach().cpu() if hasattr(tensor, "cpu") else tensor
         chunk_slices = _chunk_slices(cpu_tensor, chunk_max_bytes)
         for chunk_idx, (start, end) in enumerate(chunk_slices):
+            chunk_tensor = cpu_tensor if cpu_tensor.ndim == 0 else cpu_tensor[start:end]
             entries.append(
                 {
                     "layer_idx": layer_idx,
@@ -119,44 +120,52 @@ def _build_layer_chunk_entries(
                     "chunk_idx": chunk_idx,
                     "chunk_count": len(chunk_slices),
                     "is_last_chunk": chunk_idx == (len(chunk_slices) - 1),
+                    "nbytes": chunk_tensor.numel() * chunk_tensor.element_size(),
                     "tensor": cpu_tensor,
                 }
             )
     return entries
 
 
-def _batch_entries_by_layer(
-    entries: list[dict[str, Any]], layers_per_message: int
+def _batch_entries_by_size(
+    entries: list[dict[str, Any]],
+    max_batch_bytes: int,
+    max_chunks_per_message: int,
 ) -> list[list[dict[str, Any]]]:
-    """Batch chunks by layer groups to keep protocol behavior easy to reason about."""
-    if not entries or layers_per_message <= 0:
+    """Batch chunks greedily by byte budget to minimize message round trips."""
+    if not entries:
         return []
 
-    by_layer: dict[int, list[dict[str, Any]]] = {}
-    layer_order: list[int] = []
-    for entry in entries:
-        layer_idx = int(entry["layer_idx"])
-        if layer_idx not in by_layer:
-            by_layer[layer_idx] = []
-            layer_order.append(layer_idx)
-        by_layer[layer_idx].append(entry)
-
     batches: list[list[dict[str, Any]]] = []
-    for group_start in range(0, len(layer_order), layers_per_message):
-        group = layer_order[group_start : group_start + layers_per_message]
-        max_chunks = max(len(by_layer[layer_idx]) for layer_idx in group)
-        for chunk_pos in range(max_chunks):
-            batch_entries: list[dict[str, Any]] = []
-            for layer_idx in group:
-                layer_entries = by_layer[layer_idx]
-                if chunk_pos < len(layer_entries):
-                    batch_entries.append(layer_entries[chunk_pos])
-            if batch_entries:
-                batches.append(batch_entries)
+    current_batch: list[dict[str, Any]] = []
+    current_nbytes = 0
+    max_batch_bytes = max(1, int(max_batch_bytes))
+    max_chunks_per_message = max(0, int(max_chunks_per_message))
+
+    for entry in entries:
+        entry_nbytes = int(entry.get("nbytes", 0))
+        would_exceed_bytes = (
+            current_batch and (current_nbytes + entry_nbytes) > max_batch_bytes
+        )
+        would_exceed_chunks = (
+            max_chunks_per_message > 0
+            and len(current_batch) >= max_chunks_per_message
+        )
+        if would_exceed_bytes or would_exceed_chunks:
+            batches.append(current_batch)
+            current_batch = []
+            current_nbytes = 0
+
+        current_batch.append(entry)
+        current_nbytes += entry_nbytes
+    if current_batch:
+        batches.append(current_batch)
     return batches
+
 
 def _sanitize_layer_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+
 
 def _rehydrate_state_dict(layer_names: list[str], offload_dir: str) -> dict[str, torch.Tensor]:
     state: dict[str, torch.Tensor] = {}
@@ -216,7 +225,7 @@ class FedAvgStreaming(FedAvg):
         self._layer_names: list[str] | None = None
         self._upload_max_chunk_bytes = max_chunk_bytes
         self._download_max_chunk_bytes = max_chunk_bytes
-        self._layers_per_message = 1
+        self._chunks_per_message = 0
 
     def _download_layers_to_clients(
         self,
@@ -231,25 +240,27 @@ class FedAvgStreaming(FedAvg):
             return
 
         layer_names = self._layer_names or []
-        max_bytes_per_layer_chunk = max(
-            1, int(self._download_max_chunk_bytes // self._layers_per_message)
-        )
+        max_bytes_per_layer_chunk = max(1, int(self._download_max_chunk_bytes))
         entries = _build_layer_chunk_entries(
             layer_names,
             state_dict,
             max_bytes_per_layer_chunk,
         )
-        batches = _batch_entries_by_layer(entries, self._layers_per_message)
+        batches = _batch_entries_by_size(
+            entries,
+            self._download_max_chunk_bytes,
+            self._chunks_per_message,
+        )
         if not batches:
             return
 
         log(
             INFO,
-            "[Layer download] sending %s batches (%s chunks across %s layers, %s layers/message, %.2f MB/layer max) to %s clients",
+            "[Layer download] sending %s batches (%s chunks across %s layers, %.2f MB/message max, %.2f MB/chunk max) to %s clients",
             len(batches),
             len(entries),
             len(layer_names),
-            self._layers_per_message,
+            self._download_max_chunk_bytes / (1024 * 1024),
             max_bytes_per_layer_chunk / (1024 * 1024),
             len(node_ids),
         )
@@ -437,16 +448,19 @@ class FedAvgStreaming(FedAvg):
         self._download_max_chunk_bytes = min(
             download_target_message_bytes, SAFE_GRPC_BYTES
         )
-        layers_per_message = int(train_config.get("aggregation.layers-per-message", 1))
-        if layers_per_message <= 0:
-            raise ValueError("aggregation.layers-per-message must be > 0")
-        self._layers_per_message = layers_per_message
+        chunks_per_message = int(train_config.get("aggregation.chunks-per-message", 0))
+        if chunks_per_message < 0:
+            raise ValueError("aggregation.chunks-per-message must be >= 0")
+        self._chunks_per_message = chunks_per_message
         log(
             INFO,
-            "Layerwise target message size (upload/download): %.2f MB / %.2f MB, layers/message: %s",
+            (
+                "Layerwise target message size (upload/download): %.2f MB / %.2f MB, "
+                "chunks/message cap: %s"
+            ),
             self._upload_max_chunk_bytes / (1024 * 1024),
             self._download_max_chunk_bytes / (1024 * 1024),
-            self._layers_per_message,
+            self._chunks_per_message or "unlimited",
         )
         offload_enabled = bool(train_config.get("aggregation.offload", False))
         offload_dir = str(train_config.get("aggregation.offload-dir", ""))
@@ -592,16 +606,19 @@ class FedAvgStreaming(FedAvg):
                 upload_entries = _build_layer_chunk_entries(
                     layer_names,
                     state_dict,
-                    max(
-                        1,
-                        int(self._upload_max_chunk_bytes // self._layers_per_message),
-                    ),
+                    max(1, int(self._upload_max_chunk_bytes)),
                 )
-                upload_batches = _batch_entries_by_layer(
-                    upload_entries, self._layers_per_message
+                upload_batches = _batch_entries_by_size(
+                    upload_entries,
+                    self._upload_max_chunk_bytes,
+                    self._chunks_per_message,
                 )
                 if not upload_batches:
-                    log(WARNING, "No upload batches generated, skipping round %s", current_round)
+                    log(
+                        WARNING,
+                        "No upload batches generated, skipping round %s",
+                        current_round,
+                    )
                     continue
 
                 chunk_count_by_layer = {
@@ -615,16 +632,12 @@ class FedAvgStreaming(FedAvg):
 
                 log(
                     INFO,
-                    "[Layer upload] sending %s batches (%s chunks across %s layers, %s layers/message, %.2f MB/layer max)",
+                    "[Layer upload] sending %s batches (%s chunks across %s layers, %.2f MB/message max, %.2f MB/chunk max)",
                     len(upload_batches),
                     len(upload_entries),
                     len(layer_names),
-                    self._layers_per_message,
-                    (
-                        self._upload_max_chunk_bytes
-                        / max(1, self._layers_per_message)
-                        / (1024 * 1024)
-                    ),
+                    self._upload_max_chunk_bytes / (1024 * 1024),
+                    self._upload_max_chunk_bytes / (1024 * 1024),
                 )
                 upload_progress_every = max(1, len(upload_batches) // 10)
 
