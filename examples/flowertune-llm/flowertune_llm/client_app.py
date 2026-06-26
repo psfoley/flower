@@ -14,6 +14,7 @@ from flwr.common.config import unflatten_dict
 from omegaconf import DictConfig
 
 from flowertune_llm.dataset import replace_keys
+from flowertune_llm.compression import add_compression_metrics, compress_if_enabled
 from flowertune_llm.models import get_model
 from flowertune_llm.task import (
     CachedLayer,
@@ -549,6 +550,9 @@ def train_comms(msg: Message, context: Context):
             _COMMS_LAYER_CACHE.pop(cache_key, None)
 
     array_record = ArrayRecord(arrays)
+    array_record, compression_stats, compression_ms = compress_if_enabled(
+        array_record, config
+    )
 
     final_layer_idx, _, _, _, final_is_last_chunk = entries[-1]
     send_complete = (
@@ -572,5 +576,11 @@ def train_comms(msg: Message, context: Context):
         "config": config_record,
     })
     metric_record["profile.client.train_comms.ms"] = (t1 - t0) * 1000.0
+    add_compression_metrics(
+        metric_record,
+        prefix="profile.client.upload_compression",
+        stats=compression_stats,
+        elapsed_ms=compression_ms,
+    )
 
     return Message(content=content, reply_to=msg)

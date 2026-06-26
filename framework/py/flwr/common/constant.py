@@ -212,6 +212,7 @@ class SType:
     """Serialisation type."""
 
     NUMPY = "numpy.ndarray"
+    COMPRESSED_PIPELINE = "flwr.compressed_pipeline"
 
     def __new__(cls) -> SType:
         """Prevent instantiation."""

@@ -16,6 +16,7 @@
 
 
 from .bulyan import Bulyan
+from .compression import CompressionStrategy
 from .dp_adaptive_clipping import (
     DifferentialPrivacyClientSideAdaptiveClipping,
     DifferentialPrivacyServerSideAdaptiveClipping,
@@ -42,6 +43,7 @@ from .strategy import Strategy
 
 __all__ = [
     "Bulyan",
+    "CompressionStrategy",
     "DifferentialPrivacyClientSideAdaptiveClipping",
     "DifferentialPrivacyClientSideFixedClipping",
     "DifferentialPrivacyServerSideAdaptiveClipping",

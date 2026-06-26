@@ -52,6 +52,11 @@ from flwr.serverapp.strategy.strategy_utils import (
     sample_nodes,
 )
 
+from flowertune_llm.compression import (
+    compress_if_enabled,
+    compression_config,
+    compression_enabled,
+)
 from flowertune_llm.task import state_dict_fingerprint
 
 SAFE_GRPC_BYTES = int(GRPC_MAX_MESSAGE_LENGTH * 0.75)
@@ -233,6 +238,7 @@ class FedAvgStreaming(FedAvg):
         grid: Grid,
         node_ids: list[int],
         state_dict: dict[str, Any],
+        train_config: ConfigRecord,
         timeout: float,
     ) -> None:
         """Stream current model layers/chunks from server to selected clients."""
@@ -299,6 +305,25 @@ class FedAvgStreaming(FedAvg):
                     "download_chunks_in_message": len(batch_entries),
                 }
             )
+            for key, value in compression_config(train_config).items():
+                config[key] = value
+            arrays, compression_stats, compression_ms = compress_if_enabled(
+                arrays, train_config
+            )
+            if compression_stats is not None:
+                log(
+                    INFO,
+                    (
+                        "[Layer download] compressed batch %s/%s: "
+                        "%.2f MB -> %.2f MB (%.2fx) in %.2f ms"
+                    ),
+                    batch_idx + 1,
+                    len(batches),
+                    compression_stats.raw_bytes / (1024 * 1024),
+                    compression_stats.compressed_bytes / (1024 * 1024),
+                    compression_stats.ratio,
+                    compression_ms,
+                )
             record = RecordDict(
                 {self.arrayrecord_key: arrays, self.configrecord_key: config}
             )
@@ -365,6 +390,24 @@ class FedAvgStreaming(FedAvg):
             config["num_layers"] = len(self._layer_names)
 
         if aggregation_mode == "all_at_once":
+            for key, value in compression_config(config).items():
+                config[key] = value
+            if compression_enabled(config):
+                arrays, compression_stats, compression_ms = compress_if_enabled(
+                    arrays, config
+                )
+                if compression_stats is not None:
+                    log(
+                        INFO,
+                        (
+                            "[All-at-once download] compressed payload: "
+                            "%.2f MB -> %.2f MB (%.2fx) in %.2f ms"
+                        ),
+                        compression_stats.raw_bytes / (1024 * 1024),
+                        compression_stats.compressed_bytes / (1024 * 1024),
+                        compression_stats.ratio,
+                        compression_ms,
+                    )
             record = RecordDict(
                 {self.arrayrecord_key: arrays, self.configrecord_key: config}
             )
@@ -534,6 +577,7 @@ class FedAvgStreaming(FedAvg):
                     grid=grid,
                     node_ids=selected_node_ids,
                     state_dict=state_dict,
+                    train_config=train_config,
                     timeout=timeout,
                 )
 
@@ -667,6 +711,8 @@ class FedAvgStreaming(FedAvg):
                             "upload_chunks_in_message": len(batch_entries),
                         }
                     )
+                    for key, value in compression_config(train_config).items():
+                        config[key] = value
                     record = RecordDict({self.configrecord_key: config})
                     replies = grid.send_and_receive(
                         messages=self._construct_messages(
@@ -697,6 +743,57 @@ class FedAvgStreaming(FedAvg):
                     )
 
                     reply_contents = [msg.content for msg in valid_replies]
+                    compression_metrics = MetricRecord()
+                    for msg in valid_replies:
+                        metrics = (
+                            msg.content.get("metrics")
+                            if msg.content and "metrics" in msg.content
+                            else None
+                        )
+                        if metrics is None:
+                            continue
+                        for key in (
+                            "profile.client.upload_compression.raw_bytes",
+                            "profile.client.upload_compression.compressed_bytes",
+                            "profile.client.upload_compression.ms",
+                            "profile.client.upload_compression.arrays",
+                        ):
+                            if key in metrics:
+                                compression_metrics[key] = (
+                                    compression_metrics.get(key, 0.0)
+                                    + float(metrics[key])
+                                )
+                    if (
+                        "profile.client.upload_compression.raw_bytes"
+                        in compression_metrics
+                    ):
+                        raw_bytes = float(
+                            compression_metrics[
+                                "profile.client.upload_compression.raw_bytes"
+                            ]
+                        )
+                        compressed_bytes = float(
+                            compression_metrics[
+                                "profile.client.upload_compression.compressed_bytes"
+                            ]
+                        )
+                        log(
+                            INFO,
+                            (
+                                "[Layer upload] client compression batch %s/%s: "
+                                "%.2f MB -> %.2f MB (%.2fx), client CPU %.2f ms"
+                            ),
+                            batch_idx + 1,
+                            len(upload_batches),
+                            raw_bytes / (1024 * 1024),
+                            compressed_bytes / (1024 * 1024),
+                            raw_bytes / max(1.0, compressed_bytes),
+                            float(
+                                compression_metrics.get(
+                                    "profile.client.upload_compression.ms", 0.0
+                                )
+                            ),
+                        )
                     profiler = get_active_profiler()
                     start_time = perf_counter() if profiler is not None else None
                     agg_record = aggregate_arrayrecords(

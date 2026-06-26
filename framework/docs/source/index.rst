@@ -82,6 +82,7 @@ Problem-oriented how-to guides show step-by-step how to achieve a specific goal.
     Build <build>
     Simulate <simulate>
     Deploy <deploy>
+    Compress model updates <how-to-compress-model-updates>
 
 Explanations
 ============

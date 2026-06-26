@@ -246,6 +246,15 @@ class Array(InflatableObject):
 
     def numpy(self) -> NDArray:
         """Return the array as a NumPy array."""
+        if self.stype == SType.COMPRESSED_PIPELINE:
+            from flwr.common.compression.envelope import decode_envelope
+            from flwr.common.compression.registry import create_pipeline
+
+            envelope = decode_envelope(self.data)
+            pipeline = create_pipeline(
+                envelope.pipeline_id, **envelope.pipeline_params
+            )
+            return pipeline.backward(envelope.payload, envelope.metadata)
         if self.stype != SType.NUMPY:
             raise TypeError(
                 f"Unsupported serialization type for numpy conversion: '{self.stype}'"

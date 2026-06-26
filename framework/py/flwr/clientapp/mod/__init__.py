@@ -18,9 +18,11 @@
 from flwr.client.mod.comms_mods import arrays_size_mod, message_size_mod
 
 from .centraldp_mods import adaptiveclipping_mod, fixedclipping_mod
+from .compression_mod import CompressionMod
 from .localdp_mod import LocalDpMod
 
 __all__ = [
+    "CompressionMod",
     "LocalDpMod",
     "adaptiveclipping_mod",
     "arrays_size_mod",
