@@ -168,6 +168,25 @@ def _batch_entries_by_size(
     return batches
 
 
+def _resolve_chunks_per_message(train_config: ConfigRecord) -> int:
+    """Resolve the optional chunk cap for layerwise batched messages."""
+    if "aggregation.layers-per-message" in train_config:
+        log(
+            WARNING,
+            (
+                "aggregation.layers-per-message is deprecated and ignored. "
+                "Layerwise batching now uses aggregation.chunks-per-message "
+                "and aggregation.*-target-message-size. If profiles still show "
+                "one message per layer, rebuild/clear stale Flower app bundles."
+            ),
+        )
+
+    chunks_per_message = int(train_config.get("aggregation.chunks-per-message", 0))
+    if chunks_per_message < 0:
+        raise ValueError("aggregation.chunks-per-message must be >= 0")
+    return chunks_per_message
+
+
 def _sanitize_layer_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
 
@@ -491,10 +510,7 @@ class FedAvgStreaming(FedAvg):
         self._download_max_chunk_bytes = min(
             download_target_message_bytes, SAFE_GRPC_BYTES
         )
-        chunks_per_message = int(train_config.get("aggregation.chunks-per-message", 0))
-        if chunks_per_message < 0:
-            raise ValueError("aggregation.chunks-per-message must be >= 0")
-        self._chunks_per_message = chunks_per_message
+        self._chunks_per_message = _resolve_chunks_per_message(train_config)
         log(
             INFO,
             (
