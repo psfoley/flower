@@ -14,6 +14,7 @@ from flowertune_llm.fedavgstreaming import (
     _batch_entries_by_size,
     _build_layer_chunk_entries,
     _resolve_chunks_per_message,
+    _resolve_pipeline_depth,
 )
 
 
@@ -57,11 +58,24 @@ def test_batch_entries_by_size_honors_explicit_chunk_cap() -> None:
     assert all(len(batch) == 1 for batch in batches)
 
 
-def test_deprecated_layers_per_message_is_ignored() -> None:
-    """Old configs must not accidentally restore one-layer-per-message sends."""
-    assert _resolve_chunks_per_message({"aggregation.layers-per-message": 1}) == 0
+def test_default_chunks_per_message_is_one() -> None:
+    """Layerwise mode defaults to one layer/chunk per message."""
+    assert _resolve_chunks_per_message({}) == 1
+
+
+def test_deprecated_layers_per_message_maps_to_chunk_cap() -> None:
+    assert _resolve_chunks_per_message({"aggregation.layers-per-message": 1}) == 1
 
 
 def test_negative_chunks_per_message_is_rejected() -> None:
     with pytest.raises(ValueError, match="chunks-per-message"):
         _resolve_chunks_per_message({"aggregation.chunks-per-message": -1})
+
+
+def test_pipeline_depth_must_be_positive() -> None:
+    assert _resolve_pipeline_depth({}, "aggregation.upload-pipeline-depth") == 1
+    with pytest.raises(ValueError, match="upload-pipeline-depth"):
+        _resolve_pipeline_depth(
+            {"aggregation.upload-pipeline-depth": 0},
+            "aggregation.upload-pipeline-depth",
+        )

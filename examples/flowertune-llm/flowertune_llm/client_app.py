@@ -139,14 +139,20 @@ def train_download(msg: Message, context: Context):
 
     config = msg.content["config"]
     state_dict = msg.content["arrays"].to_torch_state_dict()
-    entries: list[tuple[str, list[int], int, int, bool]] = []
+    entries: list[tuple[int | None, str, list[int], int, int, bool]] = []
     if "download_layer_names" in config:
+        layer_idxs = (
+            [int(v) for v in list(config["download_layer_idxs"])]
+            if "download_layer_idxs" in config
+            else list(range(len(config["download_layer_names"])))
+        )
         layer_names = [str(v) for v in list(config["download_layer_names"])]
         layer_shapes = [str(v) for v in list(config["download_layer_shapes"])]
         chunk_starts = [int(v) for v in list(config["download_chunk_starts"])]
         chunk_ends = [int(v) for v in list(config["download_chunk_ends"])]
         is_last_values = list(config["download_is_last_chunk"])
         range_count = min(
+            len(layer_idxs),
             len(layer_names),
             len(layer_shapes),
             len(chunk_starts),
@@ -156,6 +162,7 @@ def train_download(msg: Message, context: Context):
         for idx in range(range_count):
             entries.append(
                 (
+                    layer_idxs[idx],
                     layer_names[idx],
                     shape_from_text(layer_shapes[idx]),
                     chunk_starts[idx],
@@ -170,19 +177,17 @@ def train_download(msg: Message, context: Context):
             chunk_ranges = parse_chunk_ranges(config)
             for start, end in chunk_ranges:
                 entries.append(
-                    (layer_name, layer_shape, start, end, is_last_batch(config))
+                    (None, layer_name, layer_shape, start, end, is_last_batch(config))
                 )
 
     if not entries:
         return Message(content=RecordDict({"metrics": MetricRecord()}), reply_to=msg)
 
     layer_base_dir = layer_dir(context)
-    touched_layer_paths: list[str] = []
-    touched_layer_names: list[str] = []
+    touched_layers: list[tuple[int | None, str, str]] = []
     touched_layer_paths_seen: set[str] = set()
-    touched_layer_names_seen: set[str] = set()
 
-    for layer_name, layer_shape, start, end, is_last_chunk in entries:
+    for layer_idx, layer_name, layer_shape, start, end, is_last_chunk in entries:
         chunk_name = chunk_key(layer_name, start, end)
         incoming = state_dict.get(chunk_name)
         if incoming is None and layer_name in state_dict:
@@ -228,26 +233,33 @@ def train_download(msg: Message, context: Context):
 
         if file_path not in touched_layer_paths_seen:
             touched_layer_paths_seen.add(file_path)
-            touched_layer_paths.append(file_path)
-        if layer_name not in touched_layer_names_seen:
-            touched_layer_names_seen.add(layer_name)
-            touched_layer_names.append(layer_name)
+            touched_layers.append((layer_idx, layer_name, file_path))
 
     # Keep context state aligned for subsequent train/train_comms calls.
     layer_paths: list[str] = []
     if STATE_LAYER_PATHS in context.state:
         layer_paths = list(context.state[STATE_LAYER_PATHS]["paths"])
-    for file_path in touched_layer_paths:
-        if file_path not in layer_paths:
-            layer_paths.append(file_path)
-    context.state[STATE_LAYER_PATHS] = ConfigRecord({"paths": layer_paths})
 
     layer_names: list[str] = []
     if STATE_LAYER_NAMES in context.state:
         layer_names = list(context.state[STATE_LAYER_NAMES]["names"])
-    for layer_name in touched_layer_names:
-        if layer_name not in layer_names:
-            layer_names.append(layer_name)
+
+    for layer_idx, layer_name, file_path in touched_layers:
+        if layer_idx is None:
+            if file_path not in layer_paths:
+                layer_paths.append(file_path)
+            if layer_name not in layer_names:
+                layer_names.append(layer_name)
+            continue
+
+        while len(layer_paths) <= layer_idx:
+            layer_paths.append("")
+        while len(layer_names) <= layer_idx:
+            layer_names.append("")
+        layer_paths[layer_idx] = file_path
+        layer_names[layer_idx] = layer_name
+
+    context.state[STATE_LAYER_PATHS] = ConfigRecord({"paths": layer_paths})
     context.state[STATE_LAYER_NAMES] = ConfigRecord({"names": layer_names})
 
     t1 = perf_counter()
