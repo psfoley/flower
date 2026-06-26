@@ -321,6 +321,12 @@ def _remove_path(path: str) -> None:
         shutil.rmtree(path)
 
 
+def cleanup_layer_paths(layer_paths: list[str]) -> None:
+    """Remove layer files tracked for layer-wise communication."""
+    for layer_path in dict.fromkeys(str(path) for path in layer_paths if path):
+        _remove_path(layer_path)
+
+
 def _replace_symlink(link_path: str, target_path: str) -> None:
     _remove_path(link_path)
     os.symlink(target_path, link_path, target_is_directory=True)
@@ -1009,18 +1015,26 @@ def run_torchtitan_training(
             "TorchTitan command failed with exit code "
             f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+    if dcp_enabled:
+        _remove_path(step0_dcp_dir)
+        _remove_path(input_dcp_dir)
+
     if os.path.exists(output_state_path):
         payload = torch.load(output_state_path, map_location="cpu")
         trained_state = extract_state_dict(payload)
+        _remove_path(input_state_path)
+        _remove_path(output_state_path)
         return _normalize_state_dict_for_hf(trained_state)
 
     if os.path.isdir(output_dcp_dir):
-        return _load_state_dict_from_dcp(
+        trained_state = _load_state_dict_from_dcp(
             output_dcp_dir,
             train_spec_name=dcp_train_spec,
             model_args_key=resolved_dcp_model_args,
             reference_state_dict=state_dict,
         )
+        _remove_path(output_dcp_dir)
+        return trained_state
 
     if os.path.islink(output_dcp_dir):
         raise FileNotFoundError(

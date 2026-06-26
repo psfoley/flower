@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-import os
-import re
+from dataclasses import dataclass
 import gc
 import io
+import json
 from logging import INFO, WARNING
+import os
+import re
 from time import perf_counter
 import time
 from typing import Any
@@ -30,6 +32,7 @@ import torch
 import psutil
 
 from flwr.common import (
+    Array,
     ArrayRecord,
     ConfigRecord,
     GRPC_MAX_MESSAGE_LENGTH,
@@ -39,6 +42,12 @@ from flwr.common import (
     RecordDict,
     log,
 )
+from flwr.common.inflatable import (
+    get_object_body,
+    get_object_children_ids_from_object_content,
+)
+from flwr.common.inflatable_protobuf_utils import make_pull_object_fn_protobuf
+from flwr.common.inflatable_utils import pull_objects
 from flwr.common.profiling import (
     get_active_profiler,
     get_current_round,
@@ -47,6 +56,10 @@ from flwr.common.profiling import (
     record_profile_metrics_from_messages,
     set_current_round,
 )
+from flwr.common.record.arraychunk import ArrayChunk
+from flwr.common.serde import message_from_proto
+from flwr.proto.appio_pb2 import PullAppMessagesRequest
+from flwr.proto.message_pb2 import ConfirmMessageReceivedRequest
 from flwr.server import Grid
 from flwr.serverapp.strategy import FedAvg, Result
 from flwr.serverapp.strategy.strategy_utils import (
@@ -55,14 +68,11 @@ from flwr.serverapp.strategy.strategy_utils import (
     sample_nodes,
 )
 
-from flowertune_llm.compression import (
-    compress_if_enabled,
-    compression_config,
-    compression_enabled,
-)
 from flowertune_llm.task import state_dict_fingerprint
 
 SAFE_GRPC_BYTES = int(GRPC_MAX_MESSAGE_LENGTH * 0.75)
+DEFAULT_LAYERWISE_CHUNKS_PER_MESSAGE = 0
+DEFAULT_LAYERWISE_DOWNLOAD_PIPELINE_DEPTH = 4
 
 
 def _chunk_slices(tensor: torch.Tensor, max_bytes: int) -> list[tuple[int, int]]:
@@ -104,6 +114,94 @@ def _split_replies(replies: Iterable[Message]) -> tuple[list[Message], list[Mess
         else:
             valid.append(msg)
     return valid, errors
+
+
+def _has_streaming_object_pull(grid: Grid) -> bool:
+    """Return whether this Grid exposes the private object pull RPCs."""
+    return all(
+        hasattr(grid, attr)
+        for attr in ("_stub", "node", "_run")  # pylint: disable=protected-access
+    )
+
+
+def _json_body(object_content: bytes, cls: type[Any]) -> dict[str, Any]:
+    """Parse a JSON body from a deflated Flower object."""
+    return json.loads(get_object_body(object_content, cls).decode("utf-8"))
+
+
+@dataclass
+class _StreamedReply:
+    """Metadata needed to pull one client's layer chunks incrementally."""
+
+    object_id: str
+    array_refs: dict[str, str]
+    metrics: MetricRecord
+
+
+class _StreamObjectReader:
+    """Pull deflated reply objects and track the time spent doing it."""
+
+    def __init__(self, grid: Grid, run_id: int) -> None:
+        self._stub = getattr(grid, "_stub")
+        self._node = getattr(grid, "node")
+        self._run_id = run_id
+        self._pull_object = make_pull_object_fn_protobuf(
+            self._stub.PullObject, self._node, run_id
+        )
+        self.pull_ms = 0.0
+
+    def pull(self, object_id: str) -> bytes:
+        """Pull one deflated object through the Grid's private object RPC."""
+        t0 = perf_counter()
+        content = pull_objects([object_id], self._pull_object)[object_id]
+        self.pull_ms += (perf_counter() - t0) * 1000.0
+        return content
+
+    def confirm(self, object_id: str) -> None:
+        """Confirm a streamed message so SuperLink can release objects."""
+        self._stub.ConfirmMessageReceived(
+            ConfirmMessageReceivedRequest(
+                node=self._node,
+                run_id=self._run_id,
+                message_object_id=object_id,
+            )
+        )
+
+    def array_refs(self, message_object_id: str) -> tuple[dict[str, str], MetricRecord]:
+        """Pull a reply's small metadata objects and return array-name refs."""
+        message_content = self.pull(message_object_id)
+        record_dict_ids = get_object_children_ids_from_object_content(message_content)
+        if not record_dict_ids:
+            return {}, MetricRecord()
+
+        record_refs = _json_body(self.pull(record_dict_ids[0]), RecordDict)
+
+        metrics = MetricRecord()
+        if metrics_id := record_refs.get("metrics"):
+            metrics = MetricRecord.inflate(self.pull(metrics_id))
+
+        array_refs: dict[str, str] = {}
+        if arrays_id := record_refs.get("arrays"):
+            array_refs = {
+                str(array_name): str(array_id)
+                for array_name, array_id in _json_body(
+                    self.pull(arrays_id), ArrayRecord
+                ).items()
+            }
+
+        return array_refs, metrics
+
+    def array(self, array_object_id: str) -> Array:
+        """Pull and inflate one Array from a streamed reply object tree."""
+        array_content = self.pull(array_object_id)
+        children = {
+            chunk_id: ArrayChunk.inflate(self.pull(chunk_id))
+            for chunk_id in get_object_children_ids_from_object_content(array_content)
+        }
+        try:
+            return Array.inflate(array_content, children=children)
+        finally:
+            children.clear()
 
 
 def _build_layer_chunk_entries(
@@ -169,35 +267,6 @@ def _batch_entries_by_size(
     if current_batch:
         batches.append(current_batch)
     return batches
-
-
-def _resolve_chunks_per_message(train_config: ConfigRecord) -> int:
-    """Resolve the optional chunk cap for layerwise batched messages."""
-    if "aggregation.layers-per-message" in train_config:
-        log(
-            WARNING,
-            (
-                "aggregation.layers-per-message is deprecated. Treating it as "
-                "aggregation.chunks-per-message for compatibility."
-            ),
-        )
-
-    chunks_per_message = int(
-        train_config.get(
-            "aggregation.chunks-per-message",
-            train_config.get("aggregation.layers-per-message", 1),
-        )
-    )
-    if chunks_per_message <= 0:
-        raise ValueError("aggregation.chunks-per-message must be > 0")
-    return chunks_per_message
-
-
-def _resolve_pipeline_depth(train_config: ConfigRecord, key: str) -> int:
-    depth = int(train_config.get(key, 1))
-    if depth <= 0:
-        raise ValueError(f"{key} must be > 0")
-    return depth
 
 
 def _record_profile_replies(replies: list[Message]) -> None:
@@ -289,9 +358,8 @@ class FedAvgStreaming(FedAvg):
         self._layer_names: list[str] | None = None
         self._upload_max_chunk_bytes = max_chunk_bytes
         self._download_max_chunk_bytes = max_chunk_bytes
-        self._chunks_per_message = 1
-        self._download_pipeline_depth = 1
-        self._upload_pipeline_depth = 1
+        self._chunks_per_message = DEFAULT_LAYERWISE_CHUNKS_PER_MESSAGE
+        self._download_pipeline_depth = DEFAULT_LAYERWISE_DOWNLOAD_PIPELINE_DEPTH
 
     def _download_layers_to_clients(
         self,
@@ -299,7 +367,6 @@ class FedAvgStreaming(FedAvg):
         grid: Grid,
         node_ids: list[int],
         state_dict: dict[str, Any],
-        train_config: ConfigRecord,
         timeout: float,
     ) -> None:
         """Stream current model layers/chunks from server to selected clients."""
@@ -363,7 +430,6 @@ class FedAvgStreaming(FedAvg):
                 payload_chunk_ends.append(end)
                 payload_is_last_chunk.append(bool(entry["is_last_chunk"]))
 
-            arrays = ArrayRecord(arrays_dict)
             config = ConfigRecord(
                 {
                     "download_layer_idxs": payload_layer_idxs,
@@ -377,27 +443,11 @@ class FedAvgStreaming(FedAvg):
                     "download_chunks_in_message": len(batch_entries),
                 }
             )
-            for key, value in compression_config(train_config).items():
-                config[key] = value
-            arrays, compression_stats, compression_ms = compress_if_enabled(
-                arrays, train_config
-            )
-            if compression_stats is not None:
-                log(
-                    INFO,
-                    (
-                        "[Layer download] compressed batch %s/%s: "
-                        "%.2f MB -> %.2f MB (%.2fx) in %.2f ms"
-                    ),
-                    batch_idx + 1,
-                    len(batches),
-                    compression_stats.raw_bytes / (1024 * 1024),
-                    compression_stats.compressed_bytes / (1024 * 1024),
-                    compression_stats.ratio,
-                    compression_ms,
-                )
             record = RecordDict(
-                {self.arrayrecord_key: arrays, self.configrecord_key: config}
+                {
+                    self.arrayrecord_key: ArrayRecord(arrays_dict),
+                    self.configrecord_key: config,
+                }
             )
             return record
 
@@ -560,13 +610,72 @@ class FedAvgStreaming(FedAvg):
 
             push_more_batches()
 
-    def _aggregate_upload_replies(
+    def _apply_aggregated_upload_chunk(
         self,
         *,
+        entry: dict[str, Any],
+        chunk_tensor: torch.Tensor,
+        state_dict: dict[str, Any],
+        aggregated_layers: dict[str, torch.Tensor],
+        offload_enabled: bool,
+        offload_dir: str,
+        chunk_count_by_layer: dict[str, int],
+        layer_names: list[str],
+    ) -> None:
+        """Apply one aggregated upload chunk to the server state."""
+        layer_idx = int(entry["layer_idx"])
+        layer_name = str(entry["layer_name"])
+        start = int(entry["start"])
+        end = int(entry["end"])
+        is_last_chunk = bool(entry["is_last_chunk"])
+
+        tensor = state_dict[layer_name]
+        full_layer_chunk = tensor.ndim == 0 or (
+            start == 0 and getattr(tensor, "ndim", 0) > 0 and end >= tensor.shape[0]
+        )
+        if full_layer_chunk:
+            aggregated_layers[layer_name] = chunk_tensor
+        else:
+            agg_tensor = aggregated_layers.get(layer_name)
+            if agg_tensor is None:
+                base_tensor = tensor.detach().cpu() if hasattr(tensor, "cpu") else tensor
+                agg_tensor = base_tensor.clone()
+            agg_tensor[start:end] = chunk_tensor
+            aggregated_layers[layer_name] = agg_tensor
+
+        if is_last_chunk:
+            final_tensor = aggregated_layers.pop(layer_name)
+            if offload_enabled:
+                file_name = f"{layer_idx:04d}_{_sanitize_layer_name(layer_name)}.pt"
+                file_path = os.path.join(offload_dir, file_name)
+                torch.save(final_tensor, file_path)
+                del state_dict[layer_name]
+            else:
+                state_dict[layer_name] = final_tensor
+            layer_count = len(layer_names)
+            progress_every = max(1, layer_count // 10)
+            if (
+                layer_idx == 0
+                or (layer_idx + 1) % progress_every == 0
+                or (layer_idx + 1) == layer_count
+            ):
+                log(
+                    INFO,
+                    "[Layer %s/%s] done (%s chunks)",
+                    layer_idx + 1,
+                    layer_count,
+                    chunk_count_by_layer.get(layer_name, 0),
+                )
+
+    def _aggregate_streamed_upload_replies(
+        self,
+        *,
+        grid: Grid,
+        msg_ids: list[str],
         batch_idx: int,
         batch_count: int,
         batch_entries: list[dict[str, Any]],
-        valid_replies: list[Message],
+        timeout: float | None,
         process: psutil.Process,
         state_dict: dict[str, Any],
         aggregated_layers: dict[str, torch.Tensor],
@@ -574,143 +683,165 @@ class FedAvgStreaming(FedAvg):
         offload_dir: str,
         chunk_count_by_layer: dict[str, int],
         layer_names: list[str],
-        current_round: int,
     ) -> None:
-        """Aggregate one layer/chunk reply batch and release reply tensors."""
-        if not valid_replies:
+        """Pull reply objects one array at a time and aggregate incrementally."""
+        if not msg_ids:
             return
+        if not _has_streaming_object_pull(grid):
+            raise RuntimeError("Grid does not expose private streaming object pull RPCs")
 
-        before_mb = process.memory_info().rss / (1024**2)
-        log(
-            INFO,
-            "Aggregation memory before (layerwise): %.2f MB",
-            before_mb,
-        )
+        run_id = getattr(getattr(grid, "_run"), "run_id")
+        stub = getattr(grid, "_stub")
+        object_reader = _StreamObjectReader(grid, run_id)
+        pending = set(msg_ids)
+        streamed_replies: list[_StreamedReply] = []
+        error_replies: list[Message] = []
+        pull_interval = float(getattr(grid, "pull_interval", 0.1))
+        end_time = None if timeout is None else time.time() + timeout
+        upstream_pull_ms = 0.0
 
-        reply_contents = [msg.content for msg in valid_replies]
-        compression_metrics = MetricRecord()
-        for msg in valid_replies:
-            metrics = (
-                msg.content.get("metrics")
-                if msg.content and "metrics" in msg.content
-                else None
+        while pending:
+            if end_time is not None and time.time() >= end_time:
+                log(
+                    WARNING,
+                    "Timed out waiting for streamed layer upload replies: %s pending",
+                    len(pending),
+                )
+                break
+
+            pull_start = perf_counter()
+            res = stub.PullMessages(
+                PullAppMessagesRequest(
+                    message_ids=list(pending),
+                    run_id=run_id,
+                )
             )
-            if metrics is None:
+            upstream_pull_ms += (perf_counter() - pull_start) * 1000.0
+            if not res.messages_list:
+                time.sleep(pull_interval)
                 continue
-            for key in (
-                "profile.client.upload_compression.raw_bytes",
-                "profile.client.upload_compression.compressed_bytes",
-                "profile.client.upload_compression.ms",
-                "profile.client.upload_compression.arrays",
+
+            for msg_proto, msg_tree in zip(
+                res.messages_list, res.message_object_trees, strict=True
             ):
-                if key in metrics:
-                    compression_metrics[key] = (
-                        compression_metrics.get(key, 0.0) + float(metrics[key])
+                light_msg = message_from_proto(msg_proto)
+                pending.discard(light_msg.metadata.reply_to_message_id)
+                if light_msg.has_error():
+                    error_replies.append(light_msg)
+                    object_reader.confirm(msg_tree.object_id)
+                    continue
+
+                array_refs, metrics = object_reader.array_refs(msg_tree.object_id)
+                streamed_replies.append(
+                    _StreamedReply(
+                        object_id=msg_tree.object_id,
+                        array_refs=array_refs,
+                        metrics=metrics,
                     )
-        if "profile.client.upload_compression.raw_bytes" in compression_metrics:
-            raw_bytes = float(
-                compression_metrics["profile.client.upload_compression.raw_bytes"]
-            )
-            compressed_bytes = float(
-                compression_metrics[
-                    "profile.client.upload_compression.compressed_bytes"
-                ]
-            )
+                )
+
+        for msg in error_replies:
             log(
-                INFO,
-                (
-                    "[Layer upload] client compression batch %s/%s: "
-                    "%.2f MB -> %.2f MB (%.2fx), client CPU %.2f ms"
-                ),
+                WARNING,
+                "[Layer upload] streamed batch %s/%s error from node %s: %s",
                 batch_idx + 1,
                 batch_count,
-                raw_bytes / (1024 * 1024),
-                compressed_bytes / (1024 * 1024),
-                raw_bytes / max(1.0, compressed_bytes),
-                float(
-                    compression_metrics.get(
-                        "profile.client.upload_compression.ms", 0.0
-                    )
-                ),
+                msg.metadata.src_node_id,
+                msg.error.reason,
             )
-        profiler = get_active_profiler()
-        start_time = perf_counter() if profiler is not None else None
-        agg_record = aggregate_arrayrecords(
-            reply_contents,
-            self.weighted_by_key,
-        )
-        if profiler is not None and start_time is not None:
-            duration_ms = (perf_counter() - start_time) * 1000.0
-            profiler.record(
-                scope="server",
-                task="aggregate",
-                round=current_round,
-                node_id=None,
-                duration_ms=duration_ms,
-                metadata={
-                    "mode": "layerwise",
-                    "batch_idx": batch_idx,
-                    "chunks_in_message": len(batch_entries),
-                },
-            )
-            publish_profile_summary()
+        if not streamed_replies:
+            return
 
-        after_mb = process.memory_info().rss / (1024**2)
-        log(
-            INFO,
-            "Aggregation memory after (layerwise): %.2f MB",
-            after_mb,
-        )
+        weights = [
+            float(reply.metrics.get(self.weighted_by_key, 1.0))
+            for reply in streamed_replies
+        ]
 
+        before_mb = process.memory_info().rss / (1024**2)
+        log(INFO, "Aggregation memory before (layerwise streamed): %.2f MB", before_mb)
+
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            weights = [1.0 for _ in streamed_replies]
+            total_weight = float(len(streamed_replies))
+        weight_factors = [weight / total_weight for weight in weights]
+
+        aggregate_ms = 0.0
         for entry in batch_entries:
-            layer_idx = int(entry["layer_idx"])
             layer_name = str(entry["layer_name"])
             start = int(entry["start"])
             end = int(entry["end"])
-            is_last_chunk = bool(entry["is_last_chunk"])
-            chunk_key = _chunk_key(layer_name, start, end)
-            if chunk_key not in agg_record:
+            key = _chunk_key(layer_name, start, end)
+            aggregated_np = None
+
+            for reply, weight in zip(streamed_replies, weight_factors, strict=True):
+                array_id = reply.array_refs.get(key)
+                if array_id is None:
+                    continue
+
+                array = object_reader.array(array_id)
+                aggregate_start = perf_counter()
+                value_np = array.numpy()
+                if value_np.dtype.kind in {"f", "c"} and weight != 1.0:
+                    value_np *= weight
+                if aggregated_np is None:
+                    aggregated_np = (
+                        value_np
+                        if value_np.dtype.kind in {"f", "c"}
+                        else value_np * weight
+                    )
+                else:
+                    if value_np.dtype.kind in {"f", "c"}:
+                        aggregated_np += value_np
+                    else:
+                        aggregated_np += value_np * weight
+                aggregate_ms += (perf_counter() - aggregate_start) * 1000.0
+                if aggregated_np is not value_np:
+                    del value_np
+                del array
+
+            if aggregated_np is None:
                 continue
 
-            tensor = state_dict[layer_name]
-            agg_tensor = aggregated_layers.get(layer_name)
-            if agg_tensor is None:
-                base_tensor = (
-                    tensor.detach().cpu() if hasattr(tensor, "cpu") else tensor
-                )
-                agg_tensor = base_tensor.clone()
-            chunk_np = agg_record[chunk_key].numpy()
-            chunk_tensor = torch.from_numpy(chunk_np)
+            apply_start = perf_counter()
+            self._apply_aggregated_upload_chunk(
+                entry=entry,
+                chunk_tensor=torch.from_numpy(aggregated_np),
+                state_dict=state_dict,
+                aggregated_layers=aggregated_layers,
+                offload_enabled=offload_enabled,
+                offload_dir=offload_dir,
+                chunk_count_by_layer=chunk_count_by_layer,
+                layer_names=layer_names,
+            )
+            aggregate_ms += (perf_counter() - apply_start) * 1000.0
+            del aggregated_np
 
-            if tensor.ndim == 0:
-                agg_tensor = chunk_tensor
-            else:
-                agg_tensor[start:end] = chunk_tensor
-            aggregated_layers[layer_name] = agg_tensor
-            del chunk_np
-            del chunk_tensor
+        for reply in streamed_replies:
+            object_reader.confirm(reply.object_id)
 
-            if is_last_chunk:
-                final_tensor = aggregated_layers.pop(layer_name, agg_tensor)
-                if offload_enabled:
-                    file_name = f"{layer_idx:04d}_{_sanitize_layer_name(layer_name)}.pt"
-                    file_path = os.path.join(offload_dir, file_name)
-                    torch.save(final_tensor, file_path)
-                    del state_dict[layer_name]
-                else:
-                    state_dict[layer_name] = final_tensor
-                del final_tensor
-                gc.collect()
-                log(
-                    INFO,
-                    "[Layer %s/%s] done (%s chunks)",
-                    layer_idx + 1,
-                    len(layer_names),
-                    chunk_count_by_layer.get(layer_name, 0),
-                )
+        _record_server_profile(
+            "network_upstream",
+            upstream_pull_ms + object_reader.pull_ms,
+            {
+                "mode": "layerwise_streamed_objects",
+                "batch_idx": batch_idx,
+                "replies": len(streamed_replies),
+                "chunks_in_message": len(batch_entries),
+            },
+        )
+        _record_server_profile(
+            "aggregate",
+            aggregate_ms,
+            {
+                "mode": "layerwise_streamed_objects",
+                "batch_idx": batch_idx,
+                "chunks_in_message": len(batch_entries),
+            },
+        )
 
-        del agg_record
-        del reply_contents
+        after_mb = process.memory_info().rss / (1024**2)
+        log(INFO, "Aggregation memory after (layerwise streamed): %.2f MB", after_mb)
         gc.collect()
 
     def configure_train(
@@ -736,24 +867,6 @@ class FedAvgStreaming(FedAvg):
             config["num_layers"] = len(self._layer_names)
 
         if aggregation_mode == "all_at_once":
-            for key, value in compression_config(config).items():
-                config[key] = value
-            if compression_enabled(config):
-                arrays, compression_stats, compression_ms = compress_if_enabled(
-                    arrays, config
-                )
-                if compression_stats is not None:
-                    log(
-                        INFO,
-                        (
-                            "[All-at-once download] compressed payload: "
-                            "%.2f MB -> %.2f MB (%.2fx) in %.2f ms"
-                        ),
-                        compression_stats.raw_bytes / (1024 * 1024),
-                        compression_stats.compressed_bytes / (1024 * 1024),
-                        compression_stats.ratio,
-                        compression_ms,
-                    )
             record = RecordDict(
                 {self.arrayrecord_key: arrays, self.configrecord_key: config}
             )
@@ -837,26 +950,18 @@ class FedAvgStreaming(FedAvg):
         self._download_max_chunk_bytes = min(
             download_target_message_bytes, SAFE_GRPC_BYTES
         )
-        self._chunks_per_message = _resolve_chunks_per_message(train_config)
-        self._download_pipeline_depth = _resolve_pipeline_depth(
-            train_config,
-            "aggregation.download-pipeline-depth",
-        )
-        self._upload_pipeline_depth = _resolve_pipeline_depth(
-            train_config,
-            "aggregation.upload-pipeline-depth",
-        )
+        self._chunks_per_message = DEFAULT_LAYERWISE_CHUNKS_PER_MESSAGE
+        self._download_pipeline_depth = DEFAULT_LAYERWISE_DOWNLOAD_PIPELINE_DEPTH
         log(
             INFO,
             (
                 "Layerwise target message size (upload/download): %.2f MB / %.2f MB, "
-                "chunks/message cap: %s, pipeline depth download/upload: %s/%s"
+                "chunks/message cap: %s, download pipeline depth: %s"
             ),
             self._upload_max_chunk_bytes / (1024 * 1024),
             self._download_max_chunk_bytes / (1024 * 1024),
             self._chunks_per_message,
             self._download_pipeline_depth,
-            self._upload_pipeline_depth,
         )
         offload_enabled = bool(train_config.get("aggregation.offload", False))
         offload_dir = str(train_config.get("aggregation.offload-dir", ""))
@@ -930,7 +1035,6 @@ class FedAvgStreaming(FedAvg):
                     grid=grid,
                     node_ids=selected_node_ids,
                     state_dict=state_dict,
-                    train_config=train_config,
                     timeout=timeout,
                 )
 
@@ -1005,11 +1109,7 @@ class FedAvgStreaming(FedAvg):
                     state_dict,
                     max(1, int(self._upload_max_chunk_bytes)),
                 )
-                upload_batches = _batch_entries_by_size(
-                    upload_entries,
-                    self._upload_max_chunk_bytes,
-                    self._chunks_per_message,
-                )
+                upload_batches = [upload_entries] if upload_entries else []
                 if not upload_batches:
                     log(
                         WARNING,
@@ -1032,14 +1132,13 @@ class FedAvgStreaming(FedAvg):
                     (
                         "[Layer upload] sending %s batches (%s chunks across %s "
                         "layers, %.2f MB/message max, %.2f MB/chunk max, "
-                        "pipeline depth %s)"
+                        "streamed object aggregation)"
                     ),
                     len(upload_batches),
                     len(upload_entries),
                     len(layer_names),
                     self._upload_max_chunk_bytes / (1024 * 1024),
                     self._upload_max_chunk_bytes / (1024 * 1024),
-                    self._upload_pipeline_depth,
                 )
                 upload_progress_every = max(1, len(upload_batches) // 10)
 
@@ -1070,8 +1169,6 @@ class FedAvgStreaming(FedAvg):
                             "upload_chunks_in_message": len(batch_entries),
                         }
                     )
-                    for key, value in compression_config(train_config).items():
-                        config[key] = value
                     return RecordDict({self.configrecord_key: config})
 
                 def log_upload_progress(batch_idx: int) -> None:
@@ -1089,171 +1186,44 @@ class FedAvgStreaming(FedAvg):
                         )
 
                 aggregated_layers: dict[str, torch.Tensor] = {}
-                if self._upload_pipeline_depth <= 1:
-                    for batch_idx, batch_entries in enumerate(upload_batches):
-                        record = build_upload_record(batch_idx, batch_entries)
-                        replies = grid.send_and_receive(
-                            messages=self._construct_messages(
-                                record,
-                                node_ids,
-                                message_type="train.layer_wise_communication",
-                            ),
-                            timeout=timeout,
+                for batch_idx, batch_entries in enumerate(upload_batches):
+                    record = build_upload_record(batch_idx, batch_entries)
+                    messages = list(
+                        self._construct_messages(
+                            record,
+                            node_ids,
+                            message_type="train.layer_wise_communication",
                         )
-                        valid_replies, error_replies = _split_replies(replies)
-                        for msg in error_replies:
-                            log(
-                                WARNING,
-                                "[Layer upload] batch %s/%s error from node %s: %s",
-                                batch_idx + 1,
-                                len(upload_batches),
-                                msg.metadata.src_node_id,
-                                msg.error.reason,
-                            )
-                        self._aggregate_upload_replies(
-                            batch_idx=batch_idx,
-                            batch_count=len(upload_batches),
-                            batch_entries=batch_entries,
-                            valid_replies=valid_replies,
-                            process=process,
-                            state_dict=state_dict,
-                            aggregated_layers=aggregated_layers,
-                            offload_enabled=offload_enabled,
-                            offload_dir=offload_dir,
-                            chunk_count_by_layer=chunk_count_by_layer,
-                            layer_names=layer_names,
-                            current_round=current_round,
-                        )
-                        del valid_replies
-                        gc.collect()
-                        log_upload_progress(batch_idx)
-                else:
-                    pending: dict[str, int] = {}
-                    batch_pending_counts: dict[int, int] = {}
-                    batch_replies: dict[int, list[Message]] = {}
-                    batch_errors: dict[int, list[Message]] = {}
-                    next_batch_idx = 0
-                    completed_batches = 0
-                    pull_interval = float(getattr(grid, "pull_interval", 0.1))
-                    end_time = None if timeout is None else time.time() + timeout
-
-                    def push_more_upload_batches() -> None:
-                        nonlocal next_batch_idx
-                        while (
-                            next_batch_idx < len(upload_batches)
-                            and len(batch_pending_counts)
-                            < self._upload_pipeline_depth
-                        ):
-                            record = build_upload_record(
-                                next_batch_idx, upload_batches[next_batch_idx]
-                            )
-                            messages = list(
-                                self._construct_messages(
-                                    record,
-                                    node_ids,
-                                    message_type="train.layer_wise_communication",
-                                )
-                            )
-                            push_start = perf_counter()
-                            msg_ids = [
-                                msg_id
-                                for msg_id in grid.push_messages(messages)
-                                if msg_id
-                            ]
-                            _record_server_profile(
-                                "network_downstream",
-                                (perf_counter() - push_start) * 1000.0,
-                                {
-                                    "expected_replies": len(msg_ids),
-                                    "batch_idx": next_batch_idx,
-                                    "pipeline_depth": self._upload_pipeline_depth,
-                                },
-                            )
-                            batch_pending_counts[next_batch_idx] = len(msg_ids)
-                            batch_replies[next_batch_idx] = []
-                            batch_errors[next_batch_idx] = []
-                            for msg_id in msg_ids:
-                                pending[msg_id] = next_batch_idx
-                            next_batch_idx += 1
-
-                    push_more_upload_batches()
-                    while completed_batches < len(upload_batches):
-                        if end_time is not None and time.time() >= end_time:
-                            log(WARNING, "Timed out waiting for pipelined layer uploads")
-                            break
-                        if not pending:
-                            push_more_upload_batches()
-                            if not pending:
-                                break
-                        pull_start = perf_counter()
-                        replies = list(grid.pull_messages(list(pending)))
-                        pull_ms = (perf_counter() - pull_start) * 1000.0
-                        if replies:
-                            _record_server_profile(
-                                "network_upstream",
-                                pull_ms,
-                                {
-                                    "received": len(replies),
-                                    "pending": len(pending),
-                                    "pipeline_depth": self._upload_pipeline_depth,
-                                },
-                            )
-                            _record_profile_replies(replies)
-                        else:
-                            time.sleep(pull_interval)
-                            continue
-
-                        newly_complete: list[int] = []
-                        for msg in replies:
-                            batch_idx = pending.pop(
-                                msg.metadata.reply_to_message_id, None
-                            )
-                            if batch_idx is None:
-                                continue
-                            batch_pending_counts[batch_idx] -= 1
-                            if msg.has_error():
-                                batch_errors[batch_idx].append(msg)
-                            else:
-                                batch_replies[batch_idx].append(msg)
-                            if batch_pending_counts[batch_idx] <= 0:
-                                newly_complete.append(batch_idx)
-
-                        for batch_idx in sorted(set(newly_complete)):
-                            error_replies = batch_errors.pop(batch_idx, [])
-                            for msg in error_replies:
-                                log(
-                                    WARNING,
-                                    (
-                                        "[Layer upload] batch %s/%s error from "
-                                        "node %s: %s"
-                                    ),
-                                    batch_idx + 1,
-                                    len(upload_batches),
-                                    msg.metadata.src_node_id,
-                                    msg.error.reason,
-                                )
-                            valid_replies = batch_replies.pop(batch_idx, [])
-                            batch_pending_counts.pop(batch_idx, None)
-                            self._aggregate_upload_replies(
-                                batch_idx=batch_idx,
-                                batch_count=len(upload_batches),
-                                batch_entries=upload_batches[batch_idx],
-                                valid_replies=valid_replies,
-                                process=process,
-                                state_dict=state_dict,
-                                aggregated_layers=aggregated_layers,
-                                offload_enabled=offload_enabled,
-                                offload_dir=offload_dir,
-                                chunk_count_by_layer=chunk_count_by_layer,
-                                layer_names=layer_names,
-                                current_round=current_round,
-                            )
-                            del valid_replies
-                            completed_batches += 1
-                            gc.collect()
-                            log_upload_progress(batch_idx)
-
-                        push_more_upload_batches()
+                    )
+                    push_start = perf_counter()
+                    msg_ids = [
+                        msg_id for msg_id in grid.push_messages(messages) if msg_id
+                    ]
+                    _record_server_profile(
+                        "network_downstream",
+                        (perf_counter() - push_start) * 1000.0,
+                        {
+                            "expected_replies": len(msg_ids),
+                            "batch_idx": batch_idx,
+                            "mode": "layerwise_streamed_objects",
+                        },
+                    )
+                    self._aggregate_streamed_upload_replies(
+                        grid=grid,
+                        msg_ids=msg_ids,
+                        batch_idx=batch_idx,
+                        batch_count=len(upload_batches),
+                        batch_entries=batch_entries,
+                        timeout=timeout,
+                        process=process,
+                        state_dict=state_dict,
+                        aggregated_layers=aggregated_layers,
+                        offload_enabled=offload_enabled,
+                        offload_dir=offload_dir,
+                        chunk_count_by_layer=chunk_count_by_layer,
+                        layer_names=layer_names,
+                    )
+                    log_upload_progress(batch_idx)
 
                 if aggregated_layers:
                     log(

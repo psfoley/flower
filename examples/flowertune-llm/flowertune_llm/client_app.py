@@ -14,11 +14,11 @@ from flwr.common.config import unflatten_dict
 from omegaconf import DictConfig
 
 from flowertune_llm.dataset import replace_keys
-from flowertune_llm.compression import add_compression_metrics, compress_if_enabled
 from flowertune_llm.models import get_model
 from flowertune_llm.task import (
     CachedLayer,
     chunk_key,
+    cleanup_layer_paths,
     context_layer_key,
     context_path_key,
     flush_cached_layer,
@@ -107,6 +107,25 @@ def _flush_comms_caches_for_context(context: Context) -> None:
     flush_caches_for_context(_COMMS_LAYER_CACHE, context, flush_before_drop=False)
 
 
+def _cleanup_layer_files_for_context(
+    context: Context, layer_paths: list[str] | None = None
+) -> None:
+    """Remove persisted layer files and clear layer-wise context state."""
+    if layer_paths is None:
+        layer_paths = (
+            list(context.state[STATE_LAYER_PATHS]["paths"])
+            if STATE_LAYER_PATHS in context.state
+            else []
+        )
+    _flush_download_caches_for_context(context)
+    _flush_comms_caches_for_context(context)
+    cleanup_layer_paths(layer_paths)
+    context.state.pop(STATE_LAYER_NAMES, None)
+    context.state.pop(STATE_LAYER_PATHS, None)
+    context.state.pop(STATE_LAYER_IDX, None)
+    context.state.pop(STATE_NUM_EXAMPLES, None)
+
+
 def _persist_layer_files(
     context: Context,
     state_dict: dict[str, torch.Tensor],
@@ -114,6 +133,12 @@ def _persist_layer_files(
 ) -> None:
     """Persist selected state_dict layers and update layer-wise context state."""
     write_dir = layer_dir(context)
+    previous_layer_paths = (
+        list(context.state[STATE_LAYER_PATHS]["paths"])
+        if STATE_LAYER_PATHS in context.state
+        else []
+    )
+    cleanup_layer_paths(previous_layer_paths)
     serialized_layer_paths: list[str] = []
     for layer_name in layer_names:
         if layer_name not in state_dict:
@@ -130,6 +155,32 @@ def _persist_layer_files(
     context.state[STATE_NUM_EXAMPLES] = ConfigRecord({"num_examples": 1})
 
 
+def _debug_add_noise_to_state_dict(
+    state_dict: dict[str, torch.Tensor], scale: float
+) -> tuple[str, float, float] | None:
+    """Perturb one floating tensor to force a distinct outgoing payload."""
+    if scale == 0.0:
+        return None
+
+    for layer_name in sorted(state_dict):
+        tensor = state_dict[layer_name]
+        if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+            continue
+        if tensor.numel() == 0:
+            continue
+        try:
+            flat = tensor.detach().view(-1)
+        except RuntimeError:
+            continue
+        before = float(flat[0].float().item())
+        with torch.no_grad():
+            flat[0].add_(float(scale))
+        after = float(flat[0].float().item())
+        return layer_name, before, after
+
+    return None
+
+
 @app.train("layer_wise_download")
 def train_download(msg: Message, context: Context):
     """Receive layer chunks from the server and persist to disk."""
@@ -138,7 +189,7 @@ def train_download(msg: Message, context: Context):
         return Message(content=RecordDict({"metrics": MetricRecord()}), reply_to=msg)
 
     config = msg.content["config"]
-    state_dict = msg.content["arrays"].to_torch_state_dict()
+    arrays = msg.content["arrays"]
     entries: list[tuple[int | None, str, list[int], int, int, bool]] = []
     if "download_layer_names" in config:
         layer_idxs = (
@@ -189,11 +240,13 @@ def train_download(msg: Message, context: Context):
 
     for layer_idx, layer_name, layer_shape, start, end, is_last_chunk in entries:
         chunk_name = chunk_key(layer_name, start, end)
-        incoming = state_dict.get(chunk_name)
-        if incoming is None and layer_name in state_dict:
-            incoming = state_dict[layer_name]
-        if incoming is None:
+        array = arrays.pop(chunk_name, None)
+        if array is None:
+            array = arrays.pop(layer_name, None)
+        if array is None:
             continue
+        incoming = torch.from_numpy(array.numpy())
+        del array
         incoming = incoming.detach().cpu()
 
         file_name = f"{sanitize_layer_name(layer_name)}.pt"
@@ -325,6 +378,7 @@ def train(msg: Message, context: Context):
         )
 
     incoming_state: dict[str, torch.Tensor] | None = None
+    incoming_state_loaded_from_layers = False
     if msg.content and "arrays" in msg.content:
         incoming_state = msg.content["arrays"].to_torch_state_dict()
     elif (
@@ -333,6 +387,7 @@ def train(msg: Message, context: Context):
         and STATE_LAYER_PATHS in context.state
     ):
         incoming_state = load_state_dict_from_layer_files(context)
+        incoming_state_loaded_from_layers = True
     elif aggregation_mode != "all_at_once" and model_preloaded:
         raise FileNotFoundError(
             "Layer-wise model was marked as preloaded, but no layer files were "
@@ -342,20 +397,45 @@ def train(msg: Message, context: Context):
     if disable_train:
         # Keep communication path alive without invoking local training workloads.
         if aggregation_mode == "all_at_once":
+            input_fingerprint = (
+                state_dict_fingerprint(incoming_state)
+                if incoming_state is not None
+                else 0.0
+            )
+            noise_scale = float(context.run_config.get("train.debug-noise-scale", 0.0))
+            noise_result = (
+                _debug_add_noise_to_state_dict(incoming_state, noise_scale)
+                if incoming_state is not None
+                else None
+            )
+            output_fingerprint = (
+                state_dict_fingerprint(incoming_state)
+                if incoming_state is not None
+                else 0.0
+            )
             arrays_out = (
                 ArrayRecord(incoming_state)
                 if incoming_state is not None
                 else ArrayRecord()
             )
             t1 = perf_counter()
-            metrics = MetricRecord(
-                {
-                    "train_loss": 0.0,
-                    "num-examples": 1,
-                    "train_skipped": 1,
-                    "profile.client.train.ms": (t1 - t0) * 1000.0,
-                }
-            )
+            metrics_dict = {
+                "train_loss": 0.0,
+                "num-examples": 1,
+                "train_skipped": 1,
+                "profile.client.train.ms": (t1 - t0) * 1000.0,
+                "model.input_fingerprint": input_fingerprint,
+                "model.output_fingerprint": output_fingerprint,
+                "model.fingerprint_delta": output_fingerprint - input_fingerprint,
+                "debug.noise_scale": noise_scale,
+                "debug.noise_applied": 1 if noise_result is not None else 0,
+            }
+            if noise_result is not None:
+                _, before, after = noise_result
+                metrics_dict["debug.noise_before"] = before
+                metrics_dict["debug.noise_after"] = after
+                metrics_dict["debug.noise_delta"] = after - before
+            metrics = MetricRecord(metrics_dict)
             return Message(
                 content=RecordDict({"arrays": arrays_out, "metrics": metrics}),
                 reply_to=msg,
@@ -396,6 +476,8 @@ def train(msg: Message, context: Context):
     model = get_model(cfg.model)
     if incoming_state is not None:
         model.load_state_dict(incoming_state, strict=True)
+        if incoming_state_loaded_from_layers:
+            _cleanup_layer_files_for_context(context)
     input_fingerprint = state_dict_fingerprint(model.state_dict())
 
     server_round = None
@@ -561,11 +643,6 @@ def train_comms(msg: Message, context: Context):
         if is_last_chunk:
             _COMMS_LAYER_CACHE.pop(cache_key, None)
 
-    array_record = ArrayRecord(arrays)
-    array_record, compression_stats, compression_ms = compress_if_enabled(
-        array_record, config
-    )
-
     final_layer_idx, _, _, _, final_is_last_chunk = entries[-1]
     send_complete = (
         bool(layer_paths)
@@ -583,16 +660,12 @@ def train_comms(msg: Message, context: Context):
     t1 = perf_counter()
     config_record = ConfigRecord({"send_complete": send_complete})
     content = RecordDict({
-        "arrays": array_record,
+        "arrays": ArrayRecord(arrays),
         "metrics": metric_record,
         "config": config_record,
     })
     metric_record["profile.client.train_comms.ms"] = (t1 - t0) * 1000.0
-    add_compression_metrics(
-        metric_record,
-        prefix="profile.client.upload_compression",
-        stats=compression_stats,
-        elapsed_ms=compression_ms,
-    )
+    if send_complete:
+        _cleanup_layer_files_for_context(context, layer_paths)
 
     return Message(content=content, reply_to=msg)
